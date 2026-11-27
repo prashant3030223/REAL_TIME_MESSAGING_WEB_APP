@@ -368,6 +368,63 @@ test("message metadata updates do not require message ownership when the text is
   });
 });
 
+test("message editing marks sent text as edited and rejects empty edits", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const currentUserId = "00000000-0000-4000-8000-000000000003";
+  const conversationId = "00000000-0000-4000-8000-000000000001";
+  const messageId = "00000000-0000-4000-8000-000000000002";
+  let updateValues: unknown[] | undefined;
+  let updateQuery = "";
+  const database = {
+    query: async (query: string, values: unknown[] = []) => {
+      if (query.includes("FROM app_sessions")) {
+        return { rows: [{ user_id: currentUserId }], rowCount: 1 };
+      }
+      if (query.includes("FROM app_conversation_members")) {
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("SELECT sender_id, text, attachments FROM app_messages")) {
+        return {
+          rows: [{ sender_id: currentUserId, text: "Original text", attachments: null }],
+          rowCount: 1,
+        };
+      }
+      if (query.includes("SET text = COALESCE")) {
+        updateQuery = query;
+        updateValues = values;
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`Unexpected message-edit database query: ${query}`);
+    },
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const endpoint = `${baseUrl}/api/conversations/${conversationId}/messages/${messageId}`;
+    const headers = {
+      "content-type": "application/json",
+      cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+    };
+    const edited = await fetch(endpoint, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ text: "Updated text" }),
+    });
+    assert.equal(edited.status, 200);
+    assert.deepEqual(await edited.json(), { updated: true });
+    assert.deepEqual(JSON.parse(String(updateValues?.[1])), { isEdited: true });
+    assert.equal(updateValues?.[8], true);
+    assert.match(updateQuery, /COALESCE\(metadata->>'isDeleted', 'false'\) <> 'true'/);
+
+    const emptyEdit = await fetch(endpoint, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ text: "   " }),
+    });
+    assert.equal(emptyEdit.status, 400);
+    assert.equal((await emptyEdit.json() as { error: { code: string } }).error.code, "EMPTY_MESSAGE");
+  });
+});
+
 test("pinning a message replaces the conversation's previous pinned message", async () => {
   const sessionToken = randomBytes(32).toString("base64url");
   const currentUserId = "00000000-0000-4000-8000-000000000003";

@@ -817,6 +817,46 @@ export function createRealtimeGateway(
             break;
           }
 
+          case "chat:edit": {
+            if (!msg.conversationId || !client.userId) break;
+            const messageId = msg.payload?.messageId;
+            if (typeof messageId !== "string" || !/^[0-9a-f-]{36}$/i.test(messageId)) break;
+
+            if (database) {
+              const editedMessage = await database.query<{ text: string }>(
+                `SELECT message.text
+                 FROM app_messages message
+                 WHERE message.id = $1 AND message.conversation_id = $2
+                   AND message.sender_id = $3
+                   AND message.metadata->>'isEdited' = 'true'
+                   AND COALESCE(message.metadata->>'isDeleted', 'false') <> 'true'`,
+                [messageId, msg.conversationId, client.userId],
+              );
+              if (!editedMessage.rows[0]) break;
+              msg.payload = {
+                messageId,
+                conversationId: msg.conversationId,
+                text: editedMessage.rows[0].text,
+                isEdited: true,
+              };
+              const { isMember } = await broadcastToConversation(
+                msg,
+                msg.conversationId,
+                client.userId,
+                clientId,
+              );
+              if (!isMember) {
+                ws.send(JSON.stringify({
+                  type: "chat:error",
+                  payload: { conversationId: msg.conversationId, messageId, code: "CONVERSATION_NOT_FOUND" },
+                }));
+              }
+            } else {
+              broadcast(msg, clientId);
+            }
+            break;
+          }
+
           case "chat:poll_vote": {
             if (!msg.conversationId || !client.userId) break;
             const messageId = msg.payload?.messageId;

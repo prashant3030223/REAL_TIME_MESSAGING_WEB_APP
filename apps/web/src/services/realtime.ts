@@ -10,6 +10,7 @@ type RealtimeEventType =
   | "chat:status"
   | "chat:read"
   | "chat:typing"
+  | "chat:edit"
   | "chat:delete"
   | "chat:pin"
   | "chat:reaction"

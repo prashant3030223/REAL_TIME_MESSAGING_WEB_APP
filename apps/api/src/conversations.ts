@@ -1636,7 +1636,27 @@ export function createConversationsRouter(
     }
 
     if (!database) {
-      response.status(200).json({ updated: true });
+      const message = (inMemoryMessages.get(conversationId) ?? []).find((item) => item.id === messageId);
+      if (!message) {
+        next(new ApiError(404, "MESSAGE_NOT_FOUND", "Message not found."));
+        return;
+      }
+      const textChanged = parsed.data.text !== undefined && parsed.data.text !== message.text;
+      if (textChanged && !parsed.data.text?.trim()) {
+        next(new ApiError(400, "EMPTY_MESSAGE", "A message cannot be edited to empty text."));
+        return;
+      }
+      if (textChanged && message.metadata["isDeleted"] === true) {
+        next(new ApiError(409, "MESSAGE_NOT_EDITABLE", "Deleted messages cannot be edited."));
+        return;
+      }
+      if (parsed.data.text !== undefined) message.text = parsed.data.text;
+      message.metadata = {
+        ...message.metadata,
+        ...(parsed.data.metadata ?? {}),
+        ...(textChanged ? { isEdited: true } : {}),
+      };
+      response.status(200).json({ updated: true, isEdited: textChanged });
       return;
     }
 
@@ -1653,8 +1673,14 @@ export function createConversationsRouter(
         return;
       }
 
+      const textChanged = parsed.data.text !== undefined && parsed.data.text !== message.text;
+      if (textChanged && !parsed.data.text?.trim()) {
+        next(new ApiError(400, "EMPTY_MESSAGE", "A message cannot be edited to empty text."));
+        return;
+      }
+
       const isSenderOnlyChange =
-        (parsed.data.text !== undefined && parsed.data.text !== message.text) ||
+        textChanged ||
         parsed.data.metadata?.isDeleted === true ||
         parsed.data.attachments !== undefined ||
         parsed.data.voiceNote !== undefined;
@@ -1674,24 +1700,34 @@ export function createConversationsRouter(
         await removeR2Attachments(conversationId, removedAttachments);
       }
 
-      await database.query(
+      const metadata = {
+        ...(parsed.data.metadata ?? {}),
+        ...(textChanged ? { isEdited: true } : {}),
+      };
+      const updated = await database.query(
         `UPDATE app_messages
          SET text = COALESCE($1, text),
-             metadata = COALESCE($2::jsonb, metadata),
+             metadata = COALESCE(metadata, '{}'::jsonb) || COALESCE($2::jsonb, '{}'::jsonb),
              attachments = CASE WHEN $3 THEN $4::jsonb ELSE attachments END,
              voice_note = CASE WHEN $5 THEN $6::jsonb ELSE voice_note END
-         WHERE id = $7 AND conversation_id = $8`,
+         WHERE id = $7 AND conversation_id = $8
+           AND ($9::boolean = false OR COALESCE(metadata->>'isDeleted', 'false') <> 'true')`,
         [
           parsed.data.text ?? null,
-          parsed.data.metadata ? JSON.stringify(parsed.data.metadata) : null,
+          Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null,
           parsed.data.attachments !== undefined,
           normalizedAttachments === null ? null : JSON.stringify(normalizedAttachments),
           parsed.data.voiceNote !== undefined,
           parsed.data.voiceNote === null ? null : JSON.stringify(parsed.data.voiceNote),
           messageId,
           conversationId,
+          textChanged,
         ],
       );
+      if (textChanged && updated.rowCount === 0) {
+        next(new ApiError(409, "MESSAGE_NOT_EDITABLE", "Deleted messages cannot be edited."));
+        return;
+      }
       if (parsed.data.metadata?.isDeleted === true) {
         await notifyDeletedMessage({
           messageId,

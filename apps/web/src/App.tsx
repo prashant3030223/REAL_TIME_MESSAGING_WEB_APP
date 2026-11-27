@@ -867,6 +867,41 @@ export function App() {
       });
     });
 
+    const unsubEdit = realtime.subscribe(
+      "chat:edit",
+      (data: { messageId?: string; conversationId?: string; text?: string; isEdited?: boolean }) => {
+        if (
+          !data?.messageId ||
+          !data.conversationId ||
+          typeof data.text !== "string" ||
+          data.isEdited !== true
+        ) return;
+        const { messageId, conversationId, text } = data;
+        setMessages((previous) => {
+          const list = previous[conversationId];
+          if (!list?.some((message) => message.id === messageId && !message.isDeleted)) return previous;
+          const updated = {
+            ...previous,
+            [conversationId]: list.map((message) =>
+              message.id === messageId ? { ...message, text, isEdited: true } : message
+            ),
+          };
+          storage.saveMessages(updated);
+          return updated;
+        });
+        setConversations((previous) => {
+          const updated = previous.map((conversation) =>
+            conversation.id === conversationId && conversation.lastMessage?.id === messageId
+              ? { ...conversation, lastMessage: { ...conversation.lastMessage, text, isEdited: true } }
+              : conversation
+          );
+          conversationsRef.current = updated;
+          storage.saveConversations(updated);
+          return updated;
+        });
+      },
+    );
+
     const unsubPin = realtime.subscribe("chat:pin", (data: { messageId: string; conversationId: string; isPinned: boolean }) => {
       if (!data?.messageId || !data?.conversationId || typeof data.isPinned !== "boolean") return;
       setMessages((prev) => {
@@ -1003,6 +1038,7 @@ export function App() {
       unsubSent();
       unsubDelivered();
       unsubDelete();
+      unsubEdit();
       unsubPin();
       unsubReaction();
       unsubPollVote();

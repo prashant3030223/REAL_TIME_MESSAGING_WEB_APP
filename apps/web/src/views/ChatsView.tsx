@@ -36,6 +36,7 @@ import {
   ChevronUp,
   ChevronDown,
   Copy,
+  Pencil,
   Forward,
   BarChart2,
   Download,
@@ -398,6 +399,8 @@ export function ChatsView({
   const [wallpaperActionError, setWallpaperActionError] = useState<string | null>(null);
   const [wallpaperActionPending, setWallpaperActionPending] = useState(false);
   const [inputText, setInputText] = useState("");
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [dismissedComposerLinkUrl, setDismissedComposerLinkUrl] = useState<string | null>(null);
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -585,6 +588,10 @@ export function ChatsView({
     setScheduledDateTime("");
     setScheduleFormError(null);
     setShowScheduleModal(false);
+    if (editingMessageId) {
+      setEditingMessageId(null);
+      setInputText("");
+    }
   }, [activeConversationId]);
 
   // Filter out messages deleted for current user
@@ -1046,6 +1053,61 @@ export function ChatsView({
     if (!inputText.trim() || !activeConv) return;
     const conversationId = activeConv.id;
     const messageText = inputText.trim();
+    if (editingMessageId) {
+      const message = (messages[conversationId] ?? []).find((item) => item.id === editingMessageId);
+      if (!message || message.isDeleted || message.senderId !== currentUser.id) {
+        setEditingMessageId(null);
+        setCopiedToast("This message can no longer be edited.");
+        window.setTimeout(() => setCopiedToast(null), 3000);
+        return;
+      }
+
+      setIsSavingEdit(true);
+      try {
+        const response = await fetch(
+          `/api/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(message.id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ text: messageText }),
+          },
+        );
+        const result = await response.json() as { error?: { message?: string } };
+        if (!response.ok) {
+          throw new Error(result.error?.message || "Could not edit this message.");
+        }
+
+        const editedMessage = { ...message, text: messageText, isEdited: true };
+        onUpdateMessages?.((previous) => ({
+          ...previous,
+          [conversationId]: (previous[conversationId] ?? []).map((item) =>
+            item.id === message.id ? editedMessage : item
+          ),
+        }));
+        onUpdateConversations?.((previous) => previous.map((conversation) =>
+          conversation.id === conversationId && conversation.lastMessage?.id === message.id
+            ? { ...conversation, lastMessage: editedMessage }
+            : conversation
+        ));
+        realtime.send(
+          "chat:edit",
+          { messageId: message.id, conversationId, text: messageText, isEdited: true },
+          conversationId,
+        );
+        setEditingMessageId(null);
+        setInputText("");
+        setDismissedComposerLinkUrl(null);
+        setCopiedToast("Message edited.");
+        window.setTimeout(() => setCopiedToast(null), 2000);
+      } catch (error) {
+        setCopiedToast(error instanceof Error ? error.message : "Could not edit this message.");
+        window.setTimeout(() => setCopiedToast(null), 3000);
+      } finally {
+        setIsSavingEdit(false);
+      }
+      return;
+    }
+
     if (typingDebounceRef.current !== null) {
       window.clearTimeout(typingDebounceRef.current);
       typingDebounceRef.current = null;
@@ -1397,6 +1459,23 @@ export function ChatsView({
   }
 
   // --- Message Actions: Delete, Star, Copy, Forward ---
+  function handleStartEditingMessage(message: Message) {
+    if (!activeConv || message.senderId !== currentUser.id || message.isDeleted || message.status === "scheduled") {
+      return;
+    }
+    setEditingMessageId(message.id);
+    setInputText(message.text);
+    setReplyingTo(null);
+    setScheduledDateTime("");
+    setActiveMenuMsgId(null);
+  }
+
+  function handleCancelEditingMessage() {
+    setEditingMessageId(null);
+    setInputText("");
+    setDismissedComposerLinkUrl(null);
+  }
+
   function handleDeleteMessage(msg: Message, forEveryone: boolean, ghostUnsend?: boolean) {
     if (!activeConv) return;
     setDeleteConfirmMsg(null);
@@ -2295,6 +2374,16 @@ export function ChatsView({
                                   </button>
                                 ) : (
                                   <>
+                                {isMe && !msg.isDeleted && (
+                                  <button
+                                    type="button"
+                                    className="msg-context-item"
+                                    onClick={() => handleStartEditingMessage(msg)}
+                                  >
+                                    <Pencil size={14} />
+                                    <span>Edit message</span>
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="msg-context-item"
@@ -2587,6 +2676,7 @@ export function ChatsView({
                               >
                                 {formatMessageTime(msg.timestamp)}
                               </span>
+                              {msg.isEdited && <span className="msg-edited-label">Edited</span>}
                               {isMe && !msg.isDeleted && (
                                 <button
                                   type="button"
@@ -2678,6 +2768,23 @@ export function ChatsView({
                 </div>
 
                 {/* Reply Quote bar */}
+                {editingMessageId && (
+                  <div className="replying-bar editing-message-bar" role="status">
+                    <div className="replying-content">
+                      <span className="replying-label">Editing message</span>
+                      <p className="replying-snippet">Your changes will be visible to everyone in this chat.</p>
+                    </div>
+                    <button
+                      type="button"
+                      className="replying-close"
+                      onClick={handleCancelEditingMessage}
+                      disabled={isSavingEdit}
+                      aria-label="Cancel editing message"
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                )}
                 {replyingTo && (
                   <div className="replying-bar">
                     <div className="replying-content">
@@ -2920,11 +3027,11 @@ export function ChatsView({
                       type="button"
                       className={`chat-send-btn ${inputText.trim() ? "is-active" : "is-idle"}`}
                       onClick={handleSend}
-                      disabled={!inputText.trim() || isSchedulingMessage}
-                      title={scheduledDateTime ? "Schedule message" : "Send message (Enter)"}
-                      aria-label={scheduledDateTime ? "Schedule message" : "Send message"}
+                      disabled={!inputText.trim() || isSchedulingMessage || isSavingEdit}
+                      title={editingMessageId ? "Save edited message" : scheduledDateTime ? "Schedule message" : "Send message (Enter)"}
+                      aria-label={editingMessageId ? "Save edited message" : scheduledDateTime ? "Schedule message" : "Send message"}
                     >
-                      {isSchedulingMessage ? <Clock size={18} className="spin-icon" /> : scheduledDateTime ? <Calendar size={18} /> : <Send size={18} />}
+                      {isSavingEdit ? <Clock size={18} className="spin-icon" /> : editingMessageId ? <Check size={18} /> : isSchedulingMessage ? <Clock size={18} className="spin-icon" /> : scheduledDateTime ? <Calendar size={18} /> : <Send size={18} />}
                     </button>
                   </div>
                   </>

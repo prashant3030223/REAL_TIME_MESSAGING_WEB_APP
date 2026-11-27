@@ -1585,6 +1585,13 @@ body.reduced-motion *::after {
   color: #99d5cb;
 }
 
+.msg-edited-label {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-style: italic;
+  line-height: 1;
+}
+
 .msg-status-icon {
   background: none;
   border: none;
