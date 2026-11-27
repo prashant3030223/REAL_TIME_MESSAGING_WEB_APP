@@ -102,6 +102,15 @@ export type ConversationMember = {
   isOnline?: boolean;
 };
 
+export type GroupPermissions = {
+  sendMessages: "everyone" | "admins";
+  sendMedia: "everyone" | "admins";
+  addMembers: "everyone" | "admins";
+  editGroupInfo: "everyone" | "admins";
+  pinMessages: "everyone" | "admins";
+  createPolls: "everyone" | "admins";
+};
+
 export type Conversation = {
   id: string;
   type: "direct" | "group" | "community-channel";
@@ -123,6 +132,7 @@ export type Conversation = {
   wallpaper?: string;
   members?: ConversationMember[];
   currentUserRole?: ConversationMember["role"];
+  groupPermissions?: GroupPermissions;
   lastMessage?: Message | undefined;
   description?: string;
   communityName?: string;

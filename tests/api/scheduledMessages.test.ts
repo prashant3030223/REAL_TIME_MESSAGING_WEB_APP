@@ -90,5 +90,77 @@ test("due scheduled messages are persisted before realtime delivery", async () =
   assert.equal(delivered?.["text"], "Deliver this");
   assert.equal(delivered?.["expiresAt"], expiresAt.toISOString());
   assert.deepEqual(delivered?.["replyTo"], { id: "reply-1", senderName: "Peer", text: "Previous" });
-}
-);
+});
+
+test("scheduled group messages are cancelled if admins-only permissions changed before delivery", async () => {
+  const messageId = "00000000-0000-4000-8000-000000000011";
+  const conversationId = "00000000-0000-4000-8000-000000000012";
+  const senderId = "00000000-0000-4000-8000-000000000013";
+  let dueClaimed = false;
+  let cancelled = false;
+  let insertedMessage = false;
+  let deliveryCalled = false;
+  const client = {
+    query: async (query: string, values: unknown[] = []) => {
+      if (query === "BEGIN" || query === "COMMIT" || query === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+      if (query.includes("FROM app_scheduled_messages scheduled")) {
+        if (dueClaimed) return { rows: [], rowCount: 0 };
+        dueClaimed = true;
+        return {
+          rows: [{
+            id: messageId,
+            conversation_id: conversationId,
+            sender_id: senderId,
+            sender_name: "Member",
+            sender_avatar: null,
+            text: "No longer allowed",
+            metadata: {},
+            scheduled_for: new Date(Date.now() - 1_000).toISOString(),
+            disappearing_timer_hours: 0,
+            conversation_type: "group",
+            group_permissions: {
+              sendMessages: "admins",
+              sendMedia: "everyone",
+              addMembers: "admins",
+              editGroupInfo: "admins",
+              pinMessages: "everyone",
+              createPolls: "everyone",
+            },
+            sender_role: "member",
+          }],
+          rowCount: 1,
+        };
+      }
+      if (query.includes("FROM app_conversation_members")) {
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("UPDATE app_scheduled_messages SET state = 'cancelled'")) {
+        assert.deepEqual(values, [messageId]);
+        cancelled = true;
+        return { rows: [], rowCount: 1 };
+      }
+      if (query.includes("INSERT INTO app_messages")) {
+        insertedMessage = true;
+      }
+      throw new Error(`Unexpected permission scheduler query: ${query}`);
+    },
+    release: () => {},
+  };
+  const database = {
+    connect: async () => client,
+  } as unknown as Pool;
+
+  await processDueScheduledMessages(
+    database,
+    async () => {
+      deliveryCalled = true;
+    },
+    pino({ enabled: false }),
+  );
+
+  assert.equal(cancelled, true);
+  assert.equal(insertedMessage, false);
+  assert.equal(deliveryCalled, false);
+});

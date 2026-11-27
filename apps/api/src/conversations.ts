@@ -16,6 +16,11 @@ import {
 import type { R2AttachmentStorage } from "./objectStorage.js";
 import { resolveSessionUserId, SESSION_COOKIE_NAME } from "./auth.js";
 import { areUsersConnected } from "./connections.js";
+import {
+  canPerformGroupAction,
+  DEFAULT_GROUP_PERMISSIONS,
+  GroupPermissionsSchema,
+} from "./groupPermissions.js";
 import type { ScheduledMessagePayload } from "./scheduledMessages.js";
 import type { PushNotificationPayload } from "./push.js";
 
@@ -35,7 +40,13 @@ const UpdateGroupSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
   description: z.string().max(1000).optional(),
   avatar: z.string().max(2048).optional(),
-}).refine((value) => value.name !== undefined || value.description !== undefined || value.avatar !== undefined);
+  groupPermissions: GroupPermissionsSchema.optional(),
+}).refine((value) =>
+  value.name !== undefined ||
+  value.description !== undefined ||
+  value.avatar !== undefined ||
+  value.groupPermissions !== undefined
+);
 const UpdateMemberRoleSchema = z.object({
   role: z.enum(["admin", "moderator", "member"]),
 });
@@ -511,6 +522,8 @@ export function createConversationsRouter(
       }
       const userId = await getUserId(request);
       await requireMembership(conversationId, userId);
+      const access = await getGroupPermissionContext(conversationId, userId);
+      requireGroupPermission(access, "sendMedia", "send media");
 
       let sizeBytes = 0;
       const countedBody = new Transform({
@@ -620,6 +633,44 @@ export function createConversationsRouter(
     return row.role;
   }
 
+  async function getGroupPermissionContext(conversationId: string, userId: string) {
+    const result = await database!.query<{
+      type: string;
+      role: string;
+      group_permissions: unknown;
+    }>(
+      `SELECT conversation.type, member.role, conversation.group_permissions
+       FROM app_conversation_members member
+       JOIN app_conversations conversation ON conversation.id = member.conversation_id
+       WHERE member.conversation_id = $1 AND member.user_id = $2`,
+      [conversationId, userId],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      throw new ApiError(404, "CONVERSATION_NOT_FOUND", "Conversation not found.");
+    }
+    return {
+      type: row.type,
+      role: row.role,
+      permissions: row.type === "group"
+        ? GroupPermissionsSchema.parse(row.group_permissions ?? DEFAULT_GROUP_PERMISSIONS)
+        : DEFAULT_GROUP_PERMISSIONS,
+    };
+  }
+
+  function requireGroupPermission(
+    access: Awaited<ReturnType<typeof getGroupPermissionContext>>,
+    permission: keyof typeof DEFAULT_GROUP_PERMISSIONS,
+    action: string,
+  ) {
+    if (
+      access.type === "group" &&
+      !canPerformGroupAction(access.role, access.permissions[permission])
+    ) {
+      throw new ApiError(403, "GROUP_PERMISSION_DENIED", `Only group admins can ${action}.`);
+    }
+  }
+
   router.get("/", async (request, response, next) => {
     if (!database) {
       const deduplicatedInMemory = [];
@@ -670,9 +721,11 @@ export function createConversationsRouter(
         last_message_created_at: Date | string | null;
         last_message_expires_at: Date | string | null;
         disappearing_timer_hours: number;
+        group_permissions: unknown;
         updated_at: Date | string;
       }>(
-        `SELECT c.id, c.type, c.name, c.description, c.avatar, c.disappearing_timer_hours, c.updated_at,
+        `SELECT c.id, c.type, c.name, c.description, c.avatar, c.disappearing_timer_hours,
+                c.group_permissions, c.updated_at,
                 own.role AS current_user_role, own.is_locked, group_members.members,
                 peer.id AS peer_user_id, peer.display_name AS peer_name,
                 peer.avatar AS peer_avatar, peer.phone AS peer_phone,
@@ -742,6 +795,9 @@ export function createConversationsRouter(
         currentUserRole: row.current_user_role,
         isLocked: row.is_locked,
         disappearingTimerHours: row.disappearing_timer_hours,
+        ...(row.type === "group"
+          ? { groupPermissions: GroupPermissionsSchema.parse(row.group_permissions ?? DEFAULT_GROUP_PERMISSIONS) }
+          : {}),
         ...(row.members ? { members: row.members } : {}),
         ...(row.peer_user_id ? { peerUserId: row.peer_user_id } : {}),
         ...(row.peer_phone ? { peerPhone: row.peer_phone } : {}),
@@ -911,6 +967,7 @@ export function createConversationsRouter(
               createdAt: new Date().toISOString(),
               updatedAt: new Date().toISOString(),
               currentUserRole: "owner",
+              ...(type === "group" ? { groupPermissions: DEFAULT_GROUP_PERMISSIONS } : {}),
               ...(groupMembers ? { members: groupMembers.rows } : {}),
             },
           });
@@ -972,17 +1029,37 @@ export function createConversationsRouter(
     }
     try {
       const userId = await getUserId(request);
-      await requireGroupAdmin(conversationId, userId);
       const updates = parsed.data;
+      const access = await getGroupPermissionContext(conversationId, userId);
+      if (access.type !== "group") {
+        throw new ApiError(404, "GROUP_NOT_FOUND", "Group not found.");
+      }
+      const isAdmin = access.role === "owner" || access.role === "admin";
+      if (updates.groupPermissions && !isAdmin) {
+        throw new ApiError(403, "GROUP_ADMIN_REQUIRED", "Only group admins can change group permissions.");
+      }
+      if (
+        (updates.name !== undefined || updates.description !== undefined || updates.avatar !== undefined) &&
+        !canPerformGroupAction(access.role, access.permissions.editGroupInfo)
+      ) {
+        throw new ApiError(403, "GROUP_PERMISSION_DENIED", "Only group admins can edit group information.");
+      }
       const result = await database.query(
         `UPDATE app_conversations
          SET name = COALESCE($1, name),
-     description = COALESCE($2, description),
-     avatar = COALESCE($3, avatar),
-     updated_at = now()
-         WHERE id = $4 AND type = 'group'
+             description = COALESCE($2, description),
+             avatar = COALESCE($3, avatar),
+             group_permissions = COALESCE($4::jsonb, group_permissions),
+             updated_at = now()
+         WHERE id = $5 AND type = 'group'
          RETURNING id`,
-        [updates.name ?? null, updates.description ?? null, updates.avatar ?? null, conversationId],
+        [
+          updates.name ?? null,
+          updates.description ?? null,
+          updates.avatar ?? null,
+          updates.groupPermissions ? JSON.stringify(updates.groupPermissions) : null,
+          conversationId,
+        ],
       );
       if (result.rowCount === 0) {
         next(new ApiError(404, "GROUP_NOT_FOUND", "Group not found."));
@@ -1082,7 +1159,11 @@ export function createConversationsRouter(
     }
     try {
       const userId = await getUserId(request);
-      await requireGroupAdmin(conversationId, userId);
+      const access = await getGroupPermissionContext(conversationId, userId);
+      if (access.type !== "group") {
+        throw new ApiError(404, "GROUP_NOT_FOUND", "Group not found.");
+      }
+      requireGroupPermission(access, "addMembers", "add members");
       const memberIds = Array.from(new Set(parsed.data.memberIds)).filter((id) => id !== userId);
       if (memberIds.length === 0) {
         next(new ApiError(400, "INVALID_GROUP_MEMBERS", "Choose another user to add."));
@@ -1504,6 +1585,8 @@ export function createConversationsRouter(
     try {
       const userId = await getUserId(request);
       await requireMembership(conversationId, userId);
+      const access = await getGroupPermissionContext(conversationId, userId);
+      requireGroupPermission(access, "sendMessages", "schedule messages");
       const sender = await database.query<{ display_name: string; avatar: string | null }>(
         "SELECT display_name, avatar FROM app_users WHERE id = $1",
         [userId],
@@ -1627,6 +1710,13 @@ export function createConversationsRouter(
       next(new ApiError(400, "INVALID_MESSAGE_PAYLOAD", "A valid text string is required."));
       return;
     }
+    if (
+      parsed.data.metadata?.["poll"] !== undefined &&
+      !PollSchema.safeParse(parsed.data.metadata["poll"]).success
+    ) {
+      next(new ApiError(400, "INVALID_POLL", "A valid poll is required."));
+      return;
+    }
 
     if (!database) {
       const { idempotencyKey, text, id, metadata, sharedContact } = parsed.data;
@@ -1669,6 +1759,16 @@ export function createConversationsRouter(
       const userId = await getUserId(request);
       await requireMembership(conversationId, userId);
       const { id, text, idempotencyKey, attachments, voiceNote, replyToId, metadata, sharedContact } = parsed.data;
+      const access = await getGroupPermissionContext(conversationId, userId);
+      const hasMedia = (attachments?.length ?? 0) > 0 || Boolean(voiceNote);
+      if (metadata?.["poll"] !== undefined) {
+        requireGroupPermission(access, "createPolls", "create polls");
+      } else if (text.trim() || sharedContact || !hasMedia) {
+        requireGroupPermission(access, "sendMessages", "send messages");
+      }
+      if (hasMedia) {
+        requireGroupPermission(access, "sendMedia", "send media");
+      }
       const normalizedAttachments = await normalizeR2Attachments(attachments, conversationId, userId);
       const inserted = await database.query<MessageRow>(
         `WITH inserted AS (
@@ -2140,6 +2240,20 @@ export function createConversationsRouter(
         return;
       }
 
+      const access = await getGroupPermissionContext(conversationId, userId);
+      if (textChanged && parsed.data.metadata?.isDeleted !== true) {
+        requireGroupPermission(access, "sendMessages", "edit messages");
+      }
+      if (parsed.data.metadata?.["poll"] !== undefined) {
+        requireGroupPermission(access, "createPolls", "create polls");
+      }
+      if (
+        (Array.isArray(parsed.data.attachments) && parsed.data.attachments.length > 0) ||
+        parsed.data.voiceNote
+      ) {
+        requireGroupPermission(access, "sendMedia", "send media");
+      }
+
       const isSenderOnlyChange =
         textChanged ||
         parsed.data.metadata?.isDeleted === true ||
@@ -2227,20 +2341,33 @@ export function createConversationsRouter(
       client = await database.connect();
       await client.query("BEGIN");
       transactionStarted = true;
-      const membership = await client.query(
-        "SELECT 1 FROM app_conversation_members WHERE conversation_id = $1 AND user_id = $2 FOR UPDATE",
+      const membership = await client.query<{ role: string }>(
+        "SELECT role FROM app_conversation_members WHERE conversation_id = $1 AND user_id = $2 FOR UPDATE",
         [conversationId, userId],
       );
       if (membership.rowCount === 0) {
         throw new ApiError(404, "CONVERSATION_NOT_FOUND", "Conversation not found.");
       }
 
-      const conversation = await client.query(
-        "SELECT id FROM app_conversations WHERE id = $1 FOR UPDATE",
+      const conversation = await client.query<{
+        id: string;
+        type: string;
+        group_permissions: unknown;
+      }>(
+        "SELECT id, type, group_permissions FROM app_conversations WHERE id = $1 FOR UPDATE",
         [conversationId],
       );
-      if (conversation.rowCount === 0) {
+      const conversationRow = conversation.rows[0];
+      if (!conversationRow) {
         throw new ApiError(404, "CONVERSATION_NOT_FOUND", "Conversation not found.");
+      }
+      if (conversationRow.type === "group") {
+        const permissions = GroupPermissionsSchema.parse(
+          conversationRow.group_permissions ?? DEFAULT_GROUP_PERMISSIONS,
+        );
+        if (!canPerformGroupAction(membership.rows[0]?.role ?? "", permissions.pinMessages)) {
+          throw new ApiError(403, "GROUP_PERMISSION_DENIED", "Only group admins can pin messages.");
+        }
       }
       const message = await client.query(
         "SELECT id FROM app_messages WHERE id = $1 AND conversation_id = $2 FOR UPDATE",

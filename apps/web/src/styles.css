@@ -5940,6 +5940,28 @@ body.reduced-motion *::after {
   font-size: 11px;
 }
 
+.group-permissions-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.group-permission-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.group-permission-row select {
+  flex: 0 0 auto;
+  max-width: 130px;
+  padding: 5px 7px;
+}
+
 .group-audit-event {
   display: flex;
   flex-direction: column;

@@ -1,5 +1,10 @@
 import type { Pool, PoolClient } from "pg";
 import type { AppLogger } from "./logger.js";
+import {
+  canPerformGroupAction,
+  DEFAULT_GROUP_PERMISSIONS,
+  GroupPermissionsSchema,
+} from "./groupPermissions.js";
 
 export type ScheduledMessagePayload = {
   id: string;
@@ -24,6 +29,9 @@ type DueScheduledMessage = {
   metadata: Record<string, unknown>;
   scheduled_for: Date | string;
   disappearing_timer_hours: number;
+  conversation_type: string;
+  group_permissions: unknown;
+  sender_role: string | null;
 };
 
 export async function processDueScheduledMessages(
@@ -46,7 +54,12 @@ export async function processDueScheduledMessages(
         `SELECT scheduled.id, scheduled.conversation_id, scheduled.sender_id,
                 sender.display_name AS sender_name, sender.avatar AS sender_avatar,
                 scheduled.text, scheduled.metadata, scheduled.scheduled_for,
-                conversation.disappearing_timer_hours
+                conversation.disappearing_timer_hours, conversation.type AS conversation_type,
+                conversation.group_permissions,
+                (SELECT member.role
+                 FROM app_conversation_members member
+                 WHERE member.conversation_id = scheduled.conversation_id
+                   AND member.user_id = scheduled.sender_id) AS sender_role
          FROM app_scheduled_messages scheduled
          JOIN app_users sender ON sender.id = scheduled.sender_id
          JOIN app_conversations conversation ON conversation.id = scheduled.conversation_id
@@ -75,6 +88,26 @@ export async function processDueScheduledMessages(
         await client.query("COMMIT");
         transactionStarted = false;
         continue;
+      }
+
+      if (message.conversation_type === "group") {
+        const permissions = GroupPermissionsSchema.parse(
+          message.group_permissions ?? DEFAULT_GROUP_PERMISSIONS,
+        );
+        if (!canPerformGroupAction(message.sender_role ?? "", permissions.sendMessages)) {
+          await client.query(
+            "UPDATE app_scheduled_messages SET state = 'cancelled' WHERE id = $1",
+            [message.id],
+          );
+          await client.query("COMMIT");
+          transactionStarted = false;
+          logger.warn({
+            messageId: message.id,
+            conversationId: message.conversation_id,
+            senderId: message.sender_id,
+          }, "Cancelled scheduled group message because permissions changed");
+          continue;
+        }
       }
 
       const inserted = await client.query<{ created_at: Date | string; expires_at: Date | string | null }>(

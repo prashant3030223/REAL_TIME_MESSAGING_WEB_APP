@@ -578,6 +578,9 @@ test("core-contact auto-read sends a live read receipt", async () => {
       if (sql.includes("SELECT 1 FROM app_conversation_members")) {
         return { rows: [{ "?column?": 1 }], rowCount: 1 };
       }
+      if (sql.includes("SELECT conversation.type, member.role, conversation.group_permissions")) {
+        return { rows: [{ type: "direct", role: "owner", group_permissions: {} }], rowCount: 1 };
+      }
       if (sql.includes("INSERT INTO app_messages") && sql.includes("RETURNING id, conversation_id")) {
         assert.match(sql, /make_interval\(hours => disappearing_timer_hours\)/);
         return {
@@ -948,6 +951,191 @@ test("group moderators can remove another member's message and the action is aud
   });
 });
 
+test("group permissions persist and restrict messaging, media, polls, pins, and member adds", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const userId = "00000000-0000-4000-8000-000000000003";
+  const conversationId = "00000000-0000-4000-8000-000000000001";
+  const messageId = "00000000-0000-4000-8000-000000000002";
+  let actorRole = "owner";
+  let permissions = {
+    sendMessages: "everyone",
+    sendMedia: "everyone",
+    addMembers: "admins",
+    editGroupInfo: "admins",
+    pinMessages: "everyone",
+    createPolls: "everyone",
+  };
+  const client = {
+    query: async (query: string) => {
+      if (query === "BEGIN" || query === "COMMIT" || query === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+      if (query.includes("SELECT role FROM app_conversation_members")) {
+        return { rows: [{ role: actorRole }], rowCount: 1 };
+      }
+      if (query.includes("SELECT id, type, group_permissions FROM app_conversations")) {
+        return { rows: [{ id: conversationId, type: "group", group_permissions: permissions }], rowCount: 1 };
+      }
+      throw new Error(`Unexpected permission transaction query: ${query}`);
+    },
+    release: () => {},
+  };
+  const database = {
+    query: async (query: string, values: unknown[] = []) => {
+      if (query.includes("SELECT user_id FROM app_sessions")) {
+        return { rows: [{ user_id: userId }], rowCount: 1 };
+      }
+      if (query.includes("SELECT conversation.type, member.role, conversation.group_permissions")) {
+        return { rows: [{ type: "group", role: actorRole, group_permissions: permissions }], rowCount: 1 };
+      }
+      if (query.includes("SELECT 1 FROM app_conversation_members own")) {
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("UPDATE app_conversations")) {
+        assert.equal(values[4], conversationId);
+        if (values[3]) permissions = JSON.parse(String(values[3])) as typeof permissions;
+        return { rows: [{ id: conversationId }], rowCount: 1 };
+      }
+      throw new Error(`Unexpected group-permission query: ${query}`);
+    },
+    connect: async () => client,
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const headers = {
+      "content-type": "application/json",
+      cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+    };
+    const settingsResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        groupPermissions: {
+          sendMessages: "admins",
+          sendMedia: "admins",
+          addMembers: "admins",
+          editGroupInfo: "everyone",
+          pinMessages: "admins",
+          createPolls: "admins",
+        },
+      }),
+    });
+    assert.equal(settingsResponse.status, 200);
+    assert.equal(permissions.sendMessages, "admins");
+
+    const invalidSettingsResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ groupPermissions: { ...permissions, unknownAction: "everyone" } }),
+    });
+    assert.equal(invalidSettingsResponse.status, 400);
+
+    actorRole = "member";
+    const messageResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "Not allowed" }),
+    });
+    assert.equal(messageResponse.status, 403);
+
+    const mediaResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "", attachments: [{ name: "file.txt" }] }),
+    });
+    assert.equal(mediaResponse.status, 403);
+
+    const contactResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        text: "",
+        sharedContact: { name: "Restricted contact", email: "contact@example.com" },
+      }),
+    });
+    assert.equal(contactResponse.status, 403);
+
+    const emptyMessageResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ text: "" }),
+    });
+    assert.equal(emptyMessageResponse.status, 403);
+
+    const uploadResponse = await fetch(
+      `${baseUrl}/api/conversations/${conversationId}/attachments/${messageId}`,
+      {
+        method: "POST",
+        headers: {
+          cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+          "x-attachment-type": "file",
+          "x-file-name": "restricted.txt",
+          "x-file-content-type": "text/plain",
+        },
+        body: "not uploaded",
+      },
+    );
+    assert.equal(uploadResponse.status, 403);
+
+    const pollResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        text: "📊 Poll: Question",
+        metadata: {
+          poll: {
+            question: "Question",
+            options: [
+              { id: "yes", text: "Yes", votes: [] },
+              { id: "no", text: "No", votes: [] },
+            ],
+          },
+        },
+      }),
+    });
+    assert.equal(pollResponse.status, 403);
+
+    const addMemberResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/members`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ memberIds: ["00000000-0000-4000-8000-000000000004"] }),
+    });
+    assert.equal(addMemberResponse.status, 403);
+
+    const scheduleResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/scheduled-messages`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        id: messageId,
+        text: "Schedule is restricted too",
+        scheduledFor: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    });
+    assert.equal(scheduleResponse.status, 403);
+
+    const groupInfoResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ name: "Members may edit this" }),
+    });
+    assert.equal(groupInfoResponse.status, 200);
+
+    const permissionChangeResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ groupPermissions: permissions }),
+    });
+    assert.equal(permissionChangeResponse.status, 403);
+
+    const pinResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/messages/${messageId}/pin`, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ isPinned: true }),
+    });
+    assert.equal(pinResponse.status, 403);
+  });
+});
+
 test("pinning a message replaces the conversation's previous pinned message", async () => {
   const sessionToken = randomBytes(32).toString("base64url");
   const currentUserId = "00000000-0000-4000-8000-000000000003";
@@ -1029,6 +1217,9 @@ test("scheduled messages require authentication, persist for the sender, and can
       if (query.includes("SELECT 1 FROM app_conversation_members")) {
         assert.deepEqual(values, [conversationId, currentUserId]);
         return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("SELECT conversation.type, member.role, conversation.group_permissions")) {
+        return { rows: [{ type: "direct", role: "owner", group_permissions: {} }], rowCount: 1 };
       }
       if (query.includes("SELECT display_name, avatar FROM app_users")) {
         return { rows: [{ display_name: "Test Sender", avatar: "/sender.svg" }], rowCount: 1 };
@@ -1468,6 +1659,9 @@ test("streams attachments larger than 10 MB to storage and serves them to conver
   const database = {
     query: async (query: string) => {
       if (query.includes("SELECT user_id FROM app_sessions")) return { rows: [{ user_id: userId }], rowCount: 1 };
+      if (query.includes("SELECT conversation.type, member.role")) {
+        return { rows: [{ type: "direct", role: "member", group_permissions: null }], rowCount: 1 };
+      }
       if (query.includes("SELECT 1 FROM app_conversation_members")) return { rows: [{}], rowCount: 1 };
       throw new Error(`Unexpected attachment database query: ${query}`);
     },
@@ -1591,6 +1785,9 @@ test("rejects an R2 attachment reference owned by another conversation", async (
     query: async (query: string) => {
       if (query.includes("SELECT user_id FROM app_sessions")) return { rows: [{ user_id: userId }], rowCount: 1 };
       if (query.includes("SELECT 1 FROM app_conversation_members")) return { rows: [{}], rowCount: 1 };
+      if (query.includes("SELECT conversation.type, member.role, conversation.group_permissions")) {
+        return { rows: [{ type: "direct", role: "member", group_permissions: {} }], rowCount: 1 };
+      }
       if (query.includes("SELECT sender_id, text, attachments")) {
         return { rows: [{ sender_id: userId, text: "Existing", attachments: [] }], rowCount: 1 };
       }
@@ -1680,6 +1877,9 @@ test("forwards R2 attachments into a new conversation-scoped object", async () =
       if (query.includes("SELECT 1 FROM app_conversation_members")) {
         assert.ok([sourceConversationId, targetConversationId].includes(values[0] as string));
         return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("SELECT conversation.type, member.role, conversation.group_permissions")) {
+        return { rows: [{ type: "direct", role: "member", group_permissions: {} }], rowCount: 1 };
       }
       if (query.includes("SELECT sender_id, text, attachments")) {
         return { rows: [{ sender_id: userId, text: "Forwarded", attachments: [] }], rowCount: 1 };

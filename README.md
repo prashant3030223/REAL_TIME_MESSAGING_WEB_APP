@@ -14,6 +14,7 @@
    - Link previews show website titles, descriptions, and privacy-preserving thumbnails fetched through validated public hosts.
    - Forward one or multiple messages to searched contacts or groups, add an optional caption, and keep the original sender private; deleted and expired messages cannot be forwarded.
    - Per-conversation disappearing-message timers (off, 1 hour, 24 hours, 7 days, 30 days, or a custom duration up to 30 days); scheduled messages start their timer when delivered.
+   - Group owners and admins can configure who may send messages/media, add members, edit group details, pin messages, and create polls; API checks enforce each setting, including scheduled delivery.
    - Scheduled message delivery and pinned messages.
 
 2. **Offline-First Resilience**:

@@ -57,6 +57,7 @@ import type {
   Message,
   MessageReadReceipt,
   SharedContact,
+  GroupPermissions,
   User,
   PollData,
   PollOption,
@@ -80,6 +81,31 @@ import { formatLastSeen } from "../services/time.js";
 import { canForwardMessage } from "../services/forwarding.js";
 
 const MAX_CUSTOM_WALLPAPER_BYTES = 10 * 1024 * 1024;
+const DEFAULT_GROUP_PERMISSIONS: GroupPermissions = {
+  sendMessages: "everyone",
+  sendMedia: "everyone",
+  addMembers: "admins",
+  editGroupInfo: "admins",
+  pinMessages: "everyone",
+  createPolls: "everyone",
+};
+const GROUP_PERMISSION_SETTINGS: Array<{ key: keyof GroupPermissions; label: string }> = [
+  { key: "sendMessages", label: "Send messages" },
+  { key: "sendMedia", label: "Send media" },
+  { key: "addMembers", label: "Add members" },
+  { key: "editGroupInfo", label: "Edit group information" },
+  { key: "pinMessages", label: "Pin messages" },
+  { key: "createPolls", label: "Create polls" },
+];
+
+function canUseGroupPermission(conversation: Conversation, permission: keyof GroupPermissions): boolean {
+  if (conversation.type !== "group") return true;
+  const mode = conversation.groupPermissions?.[permission] ?? DEFAULT_GROUP_PERMISSIONS[permission];
+  return mode === "everyone" ||
+    conversation.currentUserRole === "owner" ||
+    conversation.currentUserRole === "admin";
+}
+
 const CUSTOM_WALLPAPER_MIME_TYPES = new Set([
   "image/avif",
   "image/jpeg",
@@ -572,6 +598,7 @@ export function ChatsView({
   const [selectedNewMemberIds, setSelectedNewMemberIds] = useState<string[]>([]);
   const [groupNameDraft, setGroupNameDraft] = useState("");
   const [groupDescriptionDraft, setGroupDescriptionDraft] = useState("");
+  const [groupPermissionsDraft, setGroupPermissionsDraft] = useState<GroupPermissions>(DEFAULT_GROUP_PERMISSIONS);
   const [chatWallpapers, setChatWallpapers] = useState<Record<string, ChatWallpaperSelection>>({});
   const [customWallpaperObjectUrl, setCustomWallpaperObjectUrl] = useState<{
     conversationId: string;
@@ -853,13 +880,14 @@ export function ChatsView({
   useEffect(() => {
     setGroupNameDraft(activeConv?.name ?? "");
     setGroupDescriptionDraft(activeConv?.description ?? "");
+    setGroupPermissionsDraft(activeConv?.groupPermissions ?? DEFAULT_GROUP_PERMISSIONS);
     setGroupManageError(null);
     setShowAddGroupMembers(false);
     setSelectedNewMemberIds([]);
     setGroupAuditEvents([]);
     setGroupAuditOpen(false);
     setGroupAuditLoading(false);
-  }, [activeConv?.id, activeConv?.name, activeConv?.description]);
+  }, [activeConv?.id, activeConv?.name, activeConv?.description, activeConv?.groupPermissions]);
 
   useEffect(() => {
     const conversationId = activeConv?.id;
@@ -1348,6 +1376,18 @@ export function ChatsView({
       description: groupDescriptionDraft,
     });
     if (saved) setGroupNameDraft("");
+  }
+
+  async function handleSaveGroupPermissions() {
+    if (
+      !activeConv ||
+      (activeConv.currentUserRole !== "owner" && activeConv.currentUserRole !== "admin")
+    ) return;
+    await manageGroupRequest(
+      `/api/conversations/${encodeURIComponent(activeConv.id)}`,
+      "PATCH",
+      { groupPermissions: groupPermissionsDraft },
+    );
   }
 
   async function handleAddMembers() {
@@ -3048,14 +3088,16 @@ export function ChatsView({
                                   <Star size={14} />
                                   <span>{msg.isStarred ? "Unstar" : "Star message"}</span>
                                 </button>
-                                <button
-                                  type="button"
-                                  className="msg-context-item"
-                                  onClick={() => void handleTogglePin(msg)}
-                                >
-                                  <Pin size={14} />
-                                  <span>{msg.isPinned ? "Unpin message" : "Pin message"}</span>
-                                </button>
+                                {activeConv && canUseGroupPermission(activeConv, "pinMessages") && (
+                                  <button
+                                    type="button"
+                                    className="msg-context-item"
+                                    onClick={() => void handleTogglePin(msg)}
+                                  >
+                                    <Pin size={14} />
+                                    <span>{msg.isPinned ? "Unpin message" : "Pin message"}</span>
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="msg-context-item"
@@ -3693,6 +3735,7 @@ export function ChatsView({
                           <button
                             type="button"
                             className="attach-menu-item"
+                            disabled={!canUseGroupPermission(activeConv, "sendMedia")}
                             onClick={handleTriggerPhotoUpload}
                           >
                             <ImageIcon size={16} className="text-accent" />
@@ -3701,6 +3744,7 @@ export function ChatsView({
                           <button
                             type="button"
                             className="attach-menu-item"
+                            disabled={!canUseGroupPermission(activeConv, "sendMedia")}
                             onClick={handleTriggerDocumentUpload}
                           >
                             <FileText size={16} className="text-warning" />
@@ -3709,26 +3753,30 @@ export function ChatsView({
                           <button
                             type="button"
                             className="attach-menu-item"
+                            disabled={!canUseGroupPermission(activeConv, "sendMessages")}
                             onClick={handleOpenContactShareModal}
                           >
                             <UserIcon size={16} className="text-accent" />
                             <span>Share contact</span>
                           </button>
+                          {canUseGroupPermission(activeConv, "createPolls") && (
+                            <button
+                              type="button"
+                              className="attach-menu-item"
+                              onClick={() => {
+                                setShowAttachMenu(false);
+                                clearScheduleForImmediateSend();
+                                setShowPollModal(true);
+                              }}
+                            >
+                              <BarChart2 size={16} style={{ color: "#f59e0b" }} />
+                              <span>Create Poll</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             className="attach-menu-item"
-                            onClick={() => {
-                              setShowAttachMenu(false);
-                              clearScheduleForImmediateSend();
-                              setShowPollModal(true);
-                            }}
-                          >
-                            <BarChart2 size={16} style={{ color: "#f59e0b" }} />
-                            <span>Create Poll</span>
-                          </button>
-                          <button
-                            type="button"
-                            className="attach-menu-item"
+                            disabled={!canUseGroupPermission(activeConv, "sendMessages")}
                             onClick={() => {
                               setShowAttachMenu(false);
                               setScheduleFormError(null);
@@ -3747,7 +3795,12 @@ export function ChatsView({
                       <textarea
                         className={`chat-text-input ${composerLinks[0] && /^https?:\/\/\S+$/i.test(inputText.trim()) ? "is-link" : ""}`}
                         rows={1}
-                        placeholder="Type a message..."
+                        placeholder={
+                          canUseGroupPermission(activeConv, "sendMessages")
+                            ? "Type a message..."
+                            : "Only group admins can send messages"
+                        }
+                        disabled={!canUseGroupPermission(activeConv, "sendMessages")}
                         inputMode="text"
                         enterKeyHint="send"
                         value={inputText}
@@ -3788,6 +3841,7 @@ export function ChatsView({
                       type="button"
                       className="chat-tool-btn mic-btn"
                       onClick={handleStartRecordingVoice}
+                      disabled={!canUseGroupPermission(activeConv, "sendMedia")}
                       title="Record Voice Note"
                       aria-label="Record Voice Note"
                     >
@@ -3799,7 +3853,12 @@ export function ChatsView({
                       type="button"
                       className={`chat-send-btn ${inputText.trim() ? "is-active" : "is-idle"}`}
                       onClick={handleSend}
-                      disabled={!inputText.trim() || isSchedulingMessage || isSavingEdit}
+                      disabled={
+                        !inputText.trim() ||
+                        !canUseGroupPermission(activeConv, "sendMessages") ||
+                        isSchedulingMessage ||
+                        isSavingEdit
+                      }
                       title={editingMessageId ? "Save edited message" : scheduledDateTime ? "Schedule message" : "Send message (Enter)"}
                       aria-label={editingMessageId ? "Save edited message" : scheduledDateTime ? "Schedule message" : "Send message"}
                     >
@@ -3903,7 +3962,7 @@ export function ChatsView({
                     <>
                       <div className="wa-drawer-section group-details-section">
                         <div className="wa-drawer-section-title">Group description</div>
-                        {activeConv.currentUserRole === "owner" || activeConv.currentUserRole === "admin" ? (
+                        {canUseGroupPermission(activeConv, "editGroupInfo") ? (
                           <>
                             <input
                               className="enhanced-text-field"
@@ -3934,13 +3993,46 @@ export function ChatsView({
                         )}
                       </div>
 
+                      {(activeConv.currentUserRole === "owner" || activeConv.currentUserRole === "admin") && (
+                        <div className="wa-drawer-section group-permissions-section">
+                          <div className="wa-drawer-section-title">Group permissions</div>
+                          <div className="group-permissions-list">
+                            {GROUP_PERMISSION_SETTINGS.map(({ key, label }) => (
+                              <label className="group-permission-row" key={key}>
+                                <span>{label}</span>
+                                <select
+                                  aria-label={`Who can ${label.toLowerCase()}`}
+                                  value={groupPermissionsDraft[key]}
+                                  disabled={groupActionPending}
+                                  onChange={(event) => {
+                                    const mode = event.target.value === "admins" ? "admins" : "everyone";
+                                    setGroupPermissionsDraft((previous) => ({ ...previous, [key]: mode }));
+                                  }}
+                                >
+                                  <option value="everyone">Everyone</option>
+                                  <option value="admins">Admins only</option>
+                                </select>
+                              </label>
+                            ))}
+                          </div>
+                          <button
+                            type="button"
+                            className="primary-action-btn group-save-btn"
+                            disabled={groupActionPending}
+                            onClick={() => void handleSaveGroupPermissions()}
+                          >
+                            Save permissions
+                          </button>
+                        </div>
+                      )}
+
                       <div className="wa-drawer-section group-members-section">
                         <div className="group-members-heading">
                           <div>
                             <div className="wa-drawer-section-title">Members</div>
                             <span className="group-members-count">{activeConv.members?.length ?? 0} participants</span>
                           </div>
-                          {(activeConv.currentUserRole === "owner" || activeConv.currentUserRole === "admin") && (
+                          {canUseGroupPermission(activeConv, "addMembers") && (
                             <button
                               type="button"
                               className="secondary-btn group-add-member-btn"
