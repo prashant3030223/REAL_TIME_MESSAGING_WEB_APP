@@ -17,6 +17,21 @@ ALTER TABLE app_message_receipts
   ADD COLUMN IF NOT EXISTS receipt_state text NOT NULL DEFAULT 'sent'
     CHECK (receipt_state IN ('sent', 'delivered', 'read', 'unknown'));
 
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_schema = current_schema()
+      AND table_name = 'app_message_receipts'
+      AND column_name = 'status'
+      AND is_nullable = 'NO'
+  ) THEN
+    ALTER TABLE app_message_receipts ALTER COLUMN status SET DEFAULT 'sent';
+  END IF;
+END;
+$$;
+
 UPDATE app_message_receipts
 SET receipt_state = CASE
   WHEN read_at IS NOT NULL THEN 'read'
