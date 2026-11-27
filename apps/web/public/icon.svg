@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="100%" height="100%" role="img" aria-label="ConnectSphere Icon">
+  <defs>
+    <linearGradient id="g-icon" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#06B6D4"/>
+    </linearGradient>
+    <radialGradient id="shine-icon" cx="35%" cy="28%" r="65%">
+      <stop offset="0" stop-color="#fff" stop-opacity=".5"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <style>
+    .orbit { transform-origin: 100px 100px; animation: spin 14s linear infinite; }
+    .node  { transform-box: fill-box; transform-origin: center; animation: pulse 2.4s ease-in-out infinite; }
+    .n2 { animation-delay: .8s; }
+    .n3 { animation-delay: 1.6s; }
+    .core  { transform-origin: 100px 100px; animation: breathe 3.6s ease-in-out infinite; }
+    .typing { transform-box: fill-box; transform-origin: center; animation: bounce 1.3s ease-in-out infinite; }
+    .t2 { animation-delay: .18s; }
+    .t3 { animation-delay: .36s; }
+    @keyframes spin    { to { transform: rotate(360deg); } }
+    @keyframes pulse   { 0%,100% { transform: scale(1); opacity: .9; } 50% { transform: scale(1.35); opacity: 1; } }
+    @keyframes breathe { 0%,100% { transform: scale(1); } 50% { transform: scale(1.04); } }
+    @keyframes bounce  { 0%,60%,100% { transform: translateY(0); opacity: .75; } 30% { transform: translateY(-9px); opacity: 1; } }
+  </style>
+
+  <!-- icon -->
+  <g class="orbit">
+    <circle cx="100" cy="100" r="88" fill="none" stroke="url(#g-icon)" stroke-width="2" stroke-dasharray="3 7" stroke-linecap="round" opacity=".6"/>
+    <g stroke="url(#g-icon)" stroke-width="2" opacity=".5">
+      <line x1="100" y1="100" x2="100" y2="12"/>
+      <line x1="100" y1="100" x2="176" y2="144"/>
+      <line x1="100" y1="100" x2="24" y2="144"/>
+    </g>
+    <circle class="node n1" cx="100" cy="12" r="8" fill="#6366F1"/>
+    <circle class="node n2" cx="176" cy="144" r="8" fill="#06B6D4"/>
+    <circle class="node n3" cx="24" cy="144" r="8" fill="#8B5CF6"/>
+  </g>
+  <g class="core">
+    <path d="M66 140 L52 160 L90 152 Z" fill="url(#g-icon)"/>
+    <circle cx="100" cy="100" r="56" fill="url(#g-icon)"/>
+    <circle cx="100" cy="100" r="56" fill="url(#shine-icon)"/>
+    <ellipse cx="100" cy="100" rx="56" ry="20" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="1.5"/>
+    <ellipse cx="100" cy="100" rx="20" ry="56" fill="none" stroke="#fff" stroke-opacity=".25" stroke-width="1.5"/>
+    <circle class="typing t1" cx="78"  cy="100" r="6.5" fill="#fff"/>
+    <circle class="typing t2" cx="100" cy="100" r="6.5" fill="#fff"/>
+    <circle class="typing t3" cx="122" cy="100" r="6.5" fill="#fff"/>
+  </g>
+</svg>
