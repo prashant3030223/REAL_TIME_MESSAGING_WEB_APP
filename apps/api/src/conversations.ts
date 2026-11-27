@@ -62,6 +62,28 @@ const MessageMetadataSchema = z.record(z.string(), z.unknown()).superRefine((met
       message: "Shared contact details are invalid.",
     });
   }
+  if (metadata["isForwarded"] !== undefined && typeof metadata["isForwarded"] !== "boolean") {
+    context.addIssue({
+      code: "custom",
+      path: ["isForwarded"],
+      message: "Forwarded state must be a boolean.",
+    });
+  }
+  const forwardingCaption = metadata["forwardingCaption"];
+  if (
+    forwardingCaption !== undefined &&
+    (
+      typeof forwardingCaption !== "string" ||
+      forwardingCaption.length > 1000 ||
+      metadata["isForwarded"] !== true
+    )
+  ) {
+    context.addIssue({
+      code: "custom",
+      path: ["forwardingCaption"],
+      message: "Forwarding captions must be at most 1000 characters.",
+    });
+  }
 });
 
 const CreateMessageSchema = z.object({
@@ -1457,6 +1479,7 @@ export function createConversationsRouter(
         ?.disappearingTimerHours ?? 0;
       const createdAt = new Date();
       const message = {
+        ...(metadata ?? {}),
         id: id ?? randomUUID(),
         conversationId,
         text,

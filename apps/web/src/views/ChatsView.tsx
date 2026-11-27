@@ -69,6 +69,7 @@ import {
 } from "../services/chatWallpapers.js";
 import { storage } from "../services/storage.js";
 import { formatLastSeen } from "../services/time.js";
+import { canForwardMessage } from "../services/forwarding.js";
 
 const MAX_CUSTOM_WALLPAPER_BYTES = 10 * 1024 * 1024;
 const CUSTOM_WALLPAPER_MIME_TYPES = new Set([
@@ -577,7 +578,11 @@ export function ChatsView({
   const [activeMenuMsgId, setActiveMenuMsgId] = useState<string | null>(null);
   const [dismissedReactionToolbarMsgId, setDismissedReactionToolbarMsgId] = useState<string | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
-  const [forwardModalMsg, setForwardModalMsg] = useState<Message | null>(null);
+  const [forwardModalMessages, setForwardModalMessages] = useState<Message[]>([]);
+  const [isSelectingForwardMessages, setIsSelectingForwardMessages] = useState(false);
+  const [forwardRecipientIds, setForwardRecipientIds] = useState<string[]>([]);
+  const [forwardSearchQuery, setForwardSearchQuery] = useState("");
+  const [forwardCaption, setForwardCaption] = useState("");
   const [showContactShareModal, setShowContactShareModal] = useState(false);
   const [contactNameDraft, setContactNameDraft] = useState("");
   const [contactPhoneDraft, setContactPhoneDraft] = useState("");
@@ -1950,21 +1955,95 @@ export function ChatsView({
     setTimeout(() => setCopiedToast(null), 2500);
   }
 
-  function handleForwardMessage(targetConvId: string) {
-    if (!forwardModalMsg) return;
-    const targetConv = conversations.find((c) => c.id === targetConvId);
-    if (!targetConv) return;
+  function closeForwardFlow() {
+    setForwardModalMessages([]);
+    setIsSelectingForwardMessages(false);
+    setForwardRecipientIds([]);
+    setForwardSearchQuery("");
+    setForwardCaption("");
+  }
+
+  function openForwardModal(message: Message) {
+    if (!canForwardMessage(message)) {
+      setCopiedToast("Deleted, expired, or unsent messages cannot be forwarded.");
+      setTimeout(() => setCopiedToast(null), 2500);
+      return;
+    }
+    setForwardModalMessages([message]);
+    setIsSelectingForwardMessages(false);
+    setForwardRecipientIds([]);
+    setForwardSearchQuery("");
+    setForwardCaption("");
+    setActiveMenuMsgId(null);
+  }
+
+  function toggleForwardMessageSelection(message: Message) {
+    if (!canForwardMessage(message)) return;
+    setForwardModalMessages((selected) =>
+      selected.some((item) => item.id === message.id)
+        ? selected.filter((item) => item.id !== message.id)
+        : [...selected, message],
+    );
+  }
+
+  function toggleForwardRecipient(conversationId: string) {
+    setForwardRecipientIds((selected) =>
+      selected.includes(conversationId)
+        ? selected.filter((id) => id !== conversationId)
+        : [...selected, conversationId],
+    );
+  }
+
+  function handleForwardMessages() {
+    if (forwardModalMessages.length === 0 || forwardRecipientIds.length === 0) return;
+    const validMessages = forwardModalMessages.filter((message) => canForwardMessage(message));
+    if (validMessages.length !== forwardModalMessages.length) {
+      setForwardModalMessages(validMessages);
+      setCopiedToast(
+        validMessages.length > 0
+          ? "Expired or deleted messages were removed. Review your selection."
+          : "Deleted or expired messages cannot be forwarded.",
+      );
+      setTimeout(() => setCopiedToast(null), 3000);
+      if (validMessages.length === 0) closeForwardFlow();
+      return;
+    }
+
+    const targets = forwardRecipientIds
+      .map((id) => conversations.find((conversation) => conversation.id === id))
+      .filter((conversation): conversation is Conversation => Boolean(conversation));
+    if (targets.length === 0) return;
 
     clearScheduleForImmediateSend();
-    onSendMessage(targetConv.id, forwardModalMsg.text, {
-      attachments: forwardModalMsg.attachments,
-      voiceNote: forwardModalMsg.voiceNote,
-      sharedContact: forwardModalMsg.sharedContact,
-      poll: forwardModalMsg.poll,
-    });
+    const caption = forwardCaption.trim();
+    const captions = validMessages.map((message) =>
+      [message.forwardingCaption?.trim(), caption].filter(Boolean).join("\n\n"),
+    );
+    if (captions.some((value) => value.length > 1000)) {
+      setCopiedToast("The new caption and existing forwarded caption exceed the 1000-character limit.");
+      setTimeout(() => setCopiedToast(null), 3000);
+      return;
+    }
 
-    setForwardModalMsg(null);
-    setCopiedToast(`Forwarded to ${targetConv.name}`);
+    for (const target of targets) {
+      for (const [index, message] of validMessages.entries()) {
+        onSendMessage(target.id, message.text, {
+          attachments: message.attachments,
+          voiceNote: message.voiceNote,
+          sharedContact: message.sharedContact,
+          poll: message.poll,
+          isForwarded: true,
+          ...(captions[index] ? { forwardingCaption: captions[index] } : {}),
+        });
+      }
+    }
+
+    const messageCount = validMessages.length;
+    const targetCount = targets.length;
+    closeForwardFlow();
+    setCopiedToast(
+      `Forwarded ${messageCount} message${messageCount === 1 ? "" : "s"} to ${targetCount} chat${targetCount === 1 ? "" : "s"}.`,
+    );
     setTimeout(() => setCopiedToast(null), 2500);
   }
 
@@ -2581,6 +2660,21 @@ export function ChatsView({
                     <span>Messages and files in this conversation are shared with its members.</span>
                   </div>
 
+                  {isSelectingForwardMessages && (
+                    <div className="forward-selection-toolbar" role="status">
+                      <span>{forwardModalMessages.length} message{forwardModalMessages.length === 1 ? "" : "s"} selected</span>
+                      <button type="button" className="secondary-btn" onClick={closeForwardFlow}>Cancel</button>
+                      <button
+                        type="button"
+                        className="enhanced-start-btn"
+                        disabled={forwardModalMessages.length === 0}
+                        onClick={() => setIsSelectingForwardMessages(false)}
+                      >
+                        Continue
+                      </button>
+                    </div>
+                  )}
+
                   {activeMessages.map((msg, index) => {
                     const isMe = msg.senderId === currentUser.id;
                     const messageDate = parseMessageDate(msg.timestamp);
@@ -2600,6 +2694,7 @@ export function ChatsView({
                     const nextMsg = index < activeMessages.length - 1 ? activeMessages[index + 1] : null;
                     const isFirstInGroup = !prevMsg || prevMsg.senderId !== msg.senderId || showDateDivider;
                     const isLastInGroup = !nextMsg || nextMsg.senderId !== msg.senderId;
+                    const isForwardSelected = forwardModalMessages.some((message) => message.id === msg.id);
                     const pollVoterCount = msg.poll
                       ? new Set(msg.poll.options.flatMap((option) => option.votes)).size
                       : 0;
@@ -2626,7 +2721,7 @@ export function ChatsView({
                         )}
                         <div
                           data-message-id={msg.id}
-                          className={`message-bubble-row ${isMe ? "is-mine" : "is-theirs"} ${isFirstInGroup ? "is-group-start" : ""} ${isLastInGroup ? "is-group-end" : ""} ${activeMenuMsgId === msg.id ? "has-open-menu" : ""} ${currentSearchMatchId === msg.id ? "is-current-search-match" : ""}`}
+                          className={`message-bubble-row ${isMe ? "is-mine" : "is-theirs"} ${isFirstInGroup ? "is-group-start" : ""} ${isLastInGroup ? "is-group-end" : ""} ${activeMenuMsgId === msg.id ? "has-open-menu" : ""} ${currentSearchMatchId === msg.id ? "is-current-search-match" : ""} ${isForwardSelected ? "is-forward-selected" : ""}`}
                           onMouseLeave={() => setDismissedReactionToolbarMsgId((current) =>
                             current === msg.id ? null : current
                           )}
@@ -2634,6 +2729,18 @@ export function ChatsView({
                             current === msg.id ? null : current
                           )}
                         >
+                          {isSelectingForwardMessages && (
+                            <button
+                              type="button"
+                              className="forward-message-select"
+                              aria-label={`${isForwardSelected ? "Remove" : "Select"} message for forwarding`}
+                              aria-pressed={isForwardSelected}
+                              disabled={!canForwardMessage(msg)}
+                              onClick={() => toggleForwardMessageSelection(msg)}
+                            >
+                              {isForwardSelected ? <Check size={15} /> : <Plus size={15} />}
+                            </button>
+                          )}
                           {!isMe && (
                             isFirstInGroup ? (
                               <img
@@ -2660,6 +2767,16 @@ export function ChatsView({
                               >
                                 <ChevronDown size={14} />
                               </button>
+                            )}
+
+                            {msg.isForwarded && !msg.isDeleted && (
+                              <div className="msg-forwarded-label">
+                                <Forward size={12} />
+                                <span>Forwarded</span>
+                              </div>
+                            )}
+                            {msg.isForwarded && msg.forwardingCaption && !msg.isDeleted && (
+                              <p className="msg-forwarding-caption">{msg.forwardingCaption}</p>
                             )}
 
                             {/* Message Context Dropdown Menu */}
@@ -2721,17 +2838,16 @@ export function ChatsView({
                                   <Copy size={14} />
                                   <span>{msg.sharedContact && !msg.text.trim() ? "Copy contact name" : "Copy text"}</span>
                                 </button>
-                                <button
-                                  type="button"
-                                  className="msg-context-item"
-                                  onClick={() => {
-                                    setForwardModalMsg(msg);
-                                    setActiveMenuMsgId(null);
-                                  }}
-                                >
-                                  <Forward size={14} />
-                                  <span>Forward</span>
-                                </button>
+                                {canForwardMessage(msg) && (
+                                  <button
+                                    type="button"
+                                    className="msg-context-item"
+                                    onClick={() => openForwardModal(msg)}
+                                  >
+                                    <Forward size={14} />
+                                    <span>Forward</span>
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   className="msg-context-item"
@@ -3970,54 +4086,146 @@ export function ChatsView({
             </div>
           )}
 
-          {/* Forward Message Modal */}
-          {forwardModalMsg && (
-            <div className="modal-backdrop" onClick={() => setForwardModalMsg(null)}>
-              <div className="modal-card enhanced-chat-modal" onClick={(e) => e.stopPropagation()}>
+          {/* Forward Messages Modal */}
+          {forwardModalMessages.length > 0 && !isSelectingForwardMessages && (
+            <div className="modal-backdrop" onClick={closeForwardFlow}>
+              <div
+                className="modal-card enhanced-chat-modal forward-messages-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="forward-messages-title"
+                onClick={(event) => event.stopPropagation()}
+              >
                 <div className="new-chat-modal-header">
                   <div className="new-chat-header-brand">
                     <div className="new-chat-header-icon-wrap">
                       <Forward size={20} />
                     </div>
                     <div>
-                      <h3 className="new-chat-title">Forward message to</h3>
-                      <p className="new-chat-subtitle">Select a contact or group</p>
+                      <h3 className="new-chat-title" id="forward-messages-title">
+                        Forward {forwardModalMessages.length} message{forwardModalMessages.length === 1 ? "" : "s"}
+                      </h3>
+                      <p className="new-chat-subtitle">Choose one or more chats</p>
                     </div>
                   </div>
                   <button
                     type="button"
                     className="modal-close-btn"
-                    onClick={() => setForwardModalMsg(null)}
+                    onClick={closeForwardFlow}
+                    aria-label="Close forward dialog"
                   >
                     <X size={18} />
                   </button>
                 </div>
                 <div className="modal-body enhanced-modal-body forward-modal-body">
-                  <div className="forward-conversation-list">
-                    {conversations.map((c) => (
-                      <div
-                        key={c.id}
-                        className="registered-user-card forward-conversation-card"
-                        onClick={() => handleForwardMessage(c.id)}
-                        style={{ cursor: "pointer" }}
-                      >
-                        <div className="user-card-info">
-                          <div className="forward-user-avatar-wrap">
-                            <img src={c.avatar} alt="" className="user-avatar-thumb" />
-                          </div>
-                          <div className="user-text-meta">
-                            <span className="user-display-name">{c.name}</span>
-                            <span className="user-handle">{c.description || "Active Chat"}</span>
-                          </div>
-                        </div>
-                        <button
-                          type="button"
-                          className="user-chat-action-btn"
-                        >
-                          Send
-                        </button>
+                  <div className="forward-message-preview-list">
+                    <p className="forward-privacy-note">Original sender details are not included.</p>
+                    {forwardModalMessages.map((message, index) => (
+                      <div className="forward-message-preview" key={message.id}>
+                        <strong>
+                          {message.sharedContact?.name ??
+                            (message.poll ? `Poll: ${message.poll.question}` : null) ??
+                            (message.voiceNote ? "Voice message" : null) ??
+                            (message.attachments?.length ? message.attachments.map((item) => item.name).join(", ") : null) ??
+                            "Message"}
+                        </strong>
+                        {message.forwardingCaption && (
+                          <span className="forward-preview-caption">{message.forwardingCaption}</span>
+                        )}
+                        {message.text && <p>{message.text}</p>}
+                        {message.attachments?.length ? (
+                          <span>{message.attachments.length} attachment{message.attachments.length === 1 ? "" : "s"}</span>
+                        ) : null}
+                        {index === 0 && forwardModalMessages.length > 1 && (
+                          <span className="forward-preview-order">First of {forwardModalMessages.length}</span>
+                        )}
                       </div>
                     ))}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="forward-add-more-btn"
+                    onClick={() => setIsSelectingForwardMessages(true)}
+                  >
+                    <Plus size={15} />
+                    Add more messages
+                  </button>
+
+                  <label className="forward-search-wrap">
+                    <Search size={16} aria-hidden="true" />
+                    <input
+                      type="search"
+                      className="forward-search-input"
+                      value={forwardSearchQuery}
+                      onChange={(event) => setForwardSearchQuery(event.target.value)}
+                      placeholder="Search contacts and groups"
+                      aria-label="Search forwarding destinations"
+                    />
+                  </label>
+
+                  <div className="forward-conversation-list" role="group" aria-label="Forward destinations">
+                    {conversations
+                      .filter((conversation) => {
+                        const query = forwardSearchQuery.trim().toLowerCase();
+                        return !query || `${conversation.name} ${conversation.description}`.toLowerCase().includes(query);
+                      })
+                      .map((conversation) => {
+                        const selected = forwardRecipientIds.includes(conversation.id);
+                        return (
+                          <button
+                            type="button"
+                            key={conversation.id}
+                            className={`registered-user-card forward-conversation-card ${selected ? "is-selected" : ""}`}
+                            aria-pressed={selected}
+                            onClick={() => toggleForwardRecipient(conversation.id)}
+                          >
+                            <span className="user-card-info">
+                              <span className="forward-user-avatar-wrap">
+                                <img src={conversation.avatar} alt="" className="user-avatar-thumb" />
+                              </span>
+                              <span className="user-text-meta">
+                                <span className="user-display-name">{conversation.name}</span>
+                                <span className="user-handle">
+                                  {conversation.type === "direct" ? "Contact" : "Group"}
+                                  {conversation.description ? ` · ${conversation.description}` : ""}
+                                </span>
+                              </span>
+                            </span>
+                            <span className={`forward-recipient-check ${selected ? "is-checked" : ""}`}>
+                              {selected && <Check size={14} />}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    {conversations.length > 0 &&
+                      !conversations.some((conversation) => {
+                        const query = forwardSearchQuery.trim().toLowerCase();
+                        return !query || `${conversation.name} ${conversation.description}`.toLowerCase().includes(query);
+                      }) && <p className="forward-empty-state">No chats match that search.</p>}
+                    {conversations.length === 0 && <p className="forward-empty-state">No chats available to forward to.</p>}
+                  </div>
+
+                  <label className="forward-caption-label">
+                    <span>Optional caption</span>
+                    <textarea
+                      value={forwardCaption}
+                      onChange={(event) => setForwardCaption(event.target.value)}
+                      maxLength={1000}
+                      placeholder="Add a note"
+                    />
+                  </label>
+                  <div className="forward-modal-footer">
+                    <button type="button" className="secondary-btn" onClick={closeForwardFlow}>Cancel</button>
+                    <button
+                      type="button"
+                      className="enhanced-start-btn"
+                      disabled={forwardRecipientIds.length === 0}
+                      onClick={handleForwardMessages}
+                    >
+                      <Forward size={15} />
+                      Forward to {forwardRecipientIds.length} chat{forwardRecipientIds.length === 1 ? "" : "s"}
+                    </button>
                   </div>
                 </div>
               </div>

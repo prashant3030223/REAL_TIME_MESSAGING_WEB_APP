@@ -12,6 +12,7 @@
    - Document & image attachments, emoji reaction bar (`❤️ 👍 🔥 😂 😮 👏`), and quote replies.
    - Contact cards shared from device contacts or entered manually, with call, email, copy, and vCard save actions.
    - Link previews show website titles, descriptions, and privacy-preserving thumbnails fetched through validated public hosts.
+   - Forward one or multiple messages to searched contacts or groups, add an optional caption, and keep the original sender private; deleted and expired messages cannot be forwarded.
    - Per-conversation disappearing-message timers (off, 1 hour, 24 hours, 7 days, 30 days, or a custom duration up to 30 days); scheduled messages start their timer when delivered.
    - Scheduled message delivery and pinned messages.
 

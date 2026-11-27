@@ -76,6 +76,8 @@ export type Message = {
   deletedForUserIds?: string[] | undefined; // deleted for specific users
   scheduledFor?: string | undefined;
   linkPreviewDisabled?: boolean | undefined;
+  isForwarded?: boolean | undefined;
+  forwardingCaption?: string | undefined;
   expiresInSeconds?: number | undefined;
   expiresAt?: string | undefined;
   targetUserId?: string | undefined;

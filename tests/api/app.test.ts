@@ -396,6 +396,49 @@ test("shared contacts are validated and included in message history", async () =
   });
 });
 
+test("forwarded-message metadata is preserved and validated", async () => {
+  await withServer(undefined, async (baseUrl) => {
+    const conversationResponse = await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: "Forward destination",
+        type: "direct",
+        peerUserId: "00000000-0000-4000-8000-000000000022",
+      }),
+    });
+    const { conversation } = await conversationResponse.json() as { conversation: { id: string } };
+
+    const forwarded = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "Forwarded content",
+        metadata: { isForwarded: true, forwardingCaption: "Thought you might like this." },
+      }),
+    });
+    assert.equal(forwarded.status, 201);
+    const { message } = await forwarded.json() as {
+      message: { isForwarded?: boolean; forwardingCaption?: string };
+    };
+    assert.equal(message.isForwarded, true);
+    assert.equal(message.forwardingCaption, "Thought you might like this.");
+
+    for (const metadata of [
+      { isForwarded: "yes" },
+      { forwardingCaption: "Caption without forwarded state" },
+      { isForwarded: true, forwardingCaption: "x".repeat(1001) },
+    ]) {
+      const invalid = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ text: "Invalid forward", metadata }),
+      });
+      assert.equal(invalid.status, 400);
+    }
+  });
+});
+
 test("core-contact auto-read sends a live read receipt", async () => {
   const sessionToken = randomBytes(32).toString("base64url");
   const userId = "00000000-0000-4000-8000-000000000001";
