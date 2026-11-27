@@ -10,6 +10,7 @@
    - Real-time message exchange with status receipts (sent, delivered, read blue checkmarks).
    - Voice notes with interactive waveform playback and speed controls (1x, 1.5x, 2x).
    - Document & image attachments, emoji reaction bar (`❤️ 👍 🔥 😂 😮 👏`), and quote replies.
+   - Contact cards shared from device contacts or entered manually, with call, email, copy, and vCard save actions.
    - Per-conversation disappearing-message timers (off, 1 hour, 24 hours, 7 days, 30 days, or a custom duration up to 30 days); scheduled messages start their timer when delivered.
    - Scheduled message delivery and pinned messages.
 

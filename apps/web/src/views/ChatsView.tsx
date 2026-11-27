@@ -22,6 +22,7 @@ import {
   Plus,
   Users,
   User as UserIcon,
+  Mail,
   Image as ImageIcon,
   FileText,
   Calendar,
@@ -51,7 +52,7 @@ import {
   Share2,
   Upload,
 } from "lucide-react";
-import type { Conversation, Message, User, PollData, PollOption } from "../services/types.js";
+import type { Conversation, Message, SharedContact, User, PollData, PollOption } from "../services/types.js";
 import { AudioPlayer } from "../components/AudioPlayer.js";
 import { soundFx } from "../services/soundFx.js";
 import { realtime } from "../services/realtime.js";
@@ -109,6 +110,21 @@ type ChatsViewProps = {
 type PollOptionDraft = {
   id: string;
   text: string;
+};
+
+type DeviceContact = {
+  name?: string[];
+  tel?: string[];
+  email?: string[];
+};
+
+type ContactPickerNavigator = Navigator & {
+  contacts?: {
+    select(
+      properties: Array<"name" | "tel" | "email">,
+      options?: { multiple?: boolean },
+    ): Promise<DeviceContact[]>;
+  };
 };
 
 function createPollOptionDraft(): PollOptionDraft {
@@ -324,6 +340,7 @@ function getConversationSnippet(msg?: Message, defaultDesc?: string): string {
   if (msg.status === "scheduled") return `Scheduled · ${msg.text}`;
   if (msg.voiceNote) return "🎤 Voice note";
   if (msg.poll) return `📊 Poll: ${msg.poll.question}`;
+  if (msg.sharedContact) return `👤 Contact: ${msg.sharedContact.name}`;
   if (msg.attachments && msg.attachments.length > 0) {
     const first = msg.attachments[0];
     if (first && first.type === "image") return msg.text ? `📷 ${msg.text}` : `📷 Photo`;
@@ -331,6 +348,12 @@ function getConversationSnippet(msg?: Message, defaultDesc?: string): string {
     return `📄 ${first?.name ?? "Attachment"}`;
   }
   return msg.text || defaultDesc || "No messages yet";
+}
+
+function getContactMailtoHref(email: string): string | null {
+  const [localPart, domain, ...extra] = email.split("@");
+  if (!localPart || !domain || extra.length > 0 || /[\r\n]/.test(email)) return null;
+  return `mailto:${encodeURIComponent(localPart)}@${encodeURIComponent(domain)}`;
 }
 
 function formatDateTimeLocal(date: Date): string {
@@ -437,6 +460,12 @@ export function ChatsView({
   const [dismissedReactionToolbarMsgId, setDismissedReactionToolbarMsgId] = useState<string | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [forwardModalMsg, setForwardModalMsg] = useState<Message | null>(null);
+  const [showContactShareModal, setShowContactShareModal] = useState(false);
+  const [contactNameDraft, setContactNameDraft] = useState("");
+  const [contactPhoneDraft, setContactPhoneDraft] = useState("");
+  const [contactEmailDraft, setContactEmailDraft] = useState("");
+  const [contactShareError, setContactShareError] = useState<string | null>(null);
+  const [isPickingDeviceContact, setIsPickingDeviceContact] = useState(false);
   const [deleteConfirmMsg, setDeleteConfirmMsg] = useState<Message | null>(null);
   const [showPollModal, setShowPollModal] = useState(false);
   const [pollQuestion, setPollQuestion] = useState("");
@@ -608,6 +637,7 @@ export function ChatsView({
     setScheduledDateTime("");
     setScheduleFormError(null);
     setShowScheduleModal(false);
+    setShowContactShareModal(false);
     if (editingMessageId) {
       setEditingMessageId(null);
       setInputText("");
@@ -1210,6 +1240,105 @@ export function ChatsView({
     fileInputRef.current?.click();
   }
 
+  function handleOpenContactShareModal() {
+    setShowAttachMenu(false);
+    setContactNameDraft("");
+    setContactPhoneDraft("");
+    setContactEmailDraft("");
+    setContactShareError(null);
+    setShowContactShareModal(true);
+  }
+
+  async function handlePickDeviceContact() {
+    const picker = (navigator as ContactPickerNavigator).contacts;
+    if (!picker) {
+      setContactShareError("Device contact selection isn't supported here. Enter the details manually.");
+      return;
+    }
+
+    setIsPickingDeviceContact(true);
+    setContactShareError(null);
+    try {
+      const [contact] = await picker.select(["name", "tel", "email"], { multiple: false });
+      if (!contact) return;
+      setContactNameDraft(contact.name?.[0] ?? "");
+      setContactPhoneDraft(contact.tel?.[0] ?? "");
+      setContactEmailDraft(contact.email?.[0] ?? "");
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      setContactShareError(error instanceof Error
+        ? `Could not read the selected contact: ${error.message}`
+        : "Could not read the selected contact. Enter the details manually.");
+    } finally {
+      setIsPickingDeviceContact(false);
+    }
+  }
+
+  function handleShareContact(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeConv) return;
+    const name = contactNameDraft.trim();
+    const phone = contactPhoneDraft.trim();
+    const email = contactEmailDraft.trim();
+    if (!name || (!phone && !email)) {
+      setContactShareError("Enter a contact name and at least a phone number or email address.");
+      return;
+    }
+    if (phone && (!/^\+?[0-9().\-\s]+$/.test(phone) || (phone.match(/\d/g)?.length ?? 0) < 3)) {
+      setContactShareError("Enter a valid phone number or remove it before sharing.");
+      return;
+    }
+
+    const sharedContact: SharedContact = {
+      name,
+      ...(phone ? { phone } : {}),
+      ...(email ? { email } : {}),
+    };
+    clearScheduleForImmediateSend();
+    onSendMessage(activeConv.id, "", { sharedContact });
+    setShowContactShareModal(false);
+    setContactShareError(null);
+  }
+
+  async function handleCopyContactValue(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedToast("Contact detail copied.");
+      window.setTimeout(() => setCopiedToast(null), 2500);
+    } catch (error) {
+      setCopiedToast(error instanceof Error
+        ? `Could not copy contact detail: ${error.message}`
+        : "Could not copy contact detail.");
+      window.setTimeout(() => setCopiedToast(null), 3000);
+    }
+  }
+
+  function handleDownloadContactVCard(contact: SharedContact) {
+    try {
+      const escapeField = (value: string) =>
+        value.replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+      const fields = [
+        "BEGIN:VCARD",
+        "VERSION:3.0",
+        `FN:${escapeField(contact.name)}`,
+        ...(contact.phone ? [`TEL;TYPE=CELL:${escapeField(contact.phone)}`] : []),
+        ...(contact.email ? [`EMAIL:${escapeField(contact.email)}`] : []),
+        "END:VCARD",
+      ];
+      const objectUrl = URL.createObjectURL(new Blob([fields.join("\r\n")], { type: "text/vcard;charset=utf-8" }));
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = `${contact.name.replace(/[^a-z0-9_-]+/gi, "-") || "contact"}.vcf`;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    } catch (error) {
+      setCopiedToast(error instanceof Error ? `Could not save contact: ${error.message}` : "Could not save contact.");
+      window.setTimeout(() => setCopiedToast(null), 3000);
+    }
+  }
+
   async function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>, type: "image" | "file") {
     const files = e.target.files;
     if (!files || files.length === 0 || !activeConv) return;
@@ -1711,6 +1840,7 @@ export function ChatsView({
     onSendMessage(targetConv.id, forwardModalMsg.text, {
       attachments: forwardModalMsg.attachments,
       voiceNote: forwardModalMsg.voiceNote,
+      sharedContact: forwardModalMsg.sharedContact,
       poll: forwardModalMsg.poll,
     });
 
@@ -2354,6 +2484,10 @@ export function ChatsView({
                     const pollVoterCount = msg.poll
                       ? new Set(msg.poll.options.flatMap((option) => option.votes)).size
                       : 0;
+                    const sharedContactPhoneLink = msg.sharedContact?.phone?.replace(/[^\d+]/g, "");
+                    const sharedContactEmailLink = msg.sharedContact?.email
+                      ? getContactMailtoHref(msg.sharedContact.email)
+                      : null;
 
                     const hasMediaAttachment = !msg.isDeleted && Boolean(msg.attachments?.some((a) => a.type === "image" || a.type === "video"));
                     const messageLinkPreview =
@@ -2361,6 +2495,7 @@ export function ChatsView({
                       !msg.linkPreviewDisabled &&
                       !msg.poll &&
                       !msg.voiceNote &&
+                      !msg.sharedContact &&
                       !msg.attachments?.length
                         ? getLinkPreview(msg.text)
                         : null;
@@ -2422,7 +2557,7 @@ export function ChatsView({
                                   </button>
                                 ) : (
                                   <>
-                                {isMe && !msg.isDeleted && (
+                                {isMe && !msg.isDeleted && msg.text.trim().length > 0 && (
                                   <button
                                     type="button"
                                     className="msg-context-item"
@@ -2462,10 +2597,10 @@ export function ChatsView({
                                 <button
                                   type="button"
                                   className="msg-context-item"
-                                  onClick={() => handleCopyMessageText(msg.text)}
+                                  onClick={() => handleCopyMessageText(msg.text || msg.sharedContact?.name || "")}
                                 >
                                   <Copy size={14} />
-                                  <span>Copy text</span>
+                                  <span>{msg.sharedContact && !msg.text.trim() ? "Copy contact name" : "Copy text"}</span>
                                 </button>
                                 <button
                                   type="button"
@@ -2593,6 +2728,105 @@ export function ChatsView({
                                           : pollVoterCount > 0 ? "Tap an option to change your vote" : "Be the first to vote"}
                                       </span>
                                     </div>
+                                  </div>
+                                )}
+
+                                {msg.sharedContact && (
+                                  <div
+                                    className="msg-contact-card"
+                                    role="group"
+                                    aria-label={`Shared contact: ${msg.sharedContact.name}`}
+                                    style={{
+                                      width: "min(280px, 70vw)",
+                                      maxWidth: 300,
+                                      margin: "8px 0",
+                                      padding: 14,
+                                      borderRadius: 12,
+                                      background: "rgba(0, 0, 0, 0.14)",
+                                      border: "1px solid rgba(255, 255, 255, 0.12)",
+                                    }}
+                                  >
+                                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                                      <div
+                                        aria-hidden="true"
+                                        style={{
+                                          width: 38,
+                                          height: 38,
+                                          borderRadius: "50%",
+                                          display: "grid",
+                                          placeItems: "center",
+                                          background: "rgba(0, 168, 132, 0.16)",
+                                          color: "#00a884",
+                                        }}
+                                      >
+                                        <UserIcon size={19} />
+                                      </div>
+                                      <div style={{ minWidth: 0 }}>
+                                        <strong style={{ display: "block", overflowWrap: "anywhere" }}>
+                                          {msg.sharedContact.name}
+                                        </strong>
+                                        <span style={{ fontSize: 11, opacity: 0.72 }}>Contact card</span>
+                                      </div>
+                                    </div>
+                                    {msg.sharedContact.phone && (
+                                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 7 }}>
+                                        <Phone size={14} aria-hidden="true" />
+                                        {sharedContactPhoneLink && (
+                                          <a href={`tel:${sharedContactPhoneLink}`} style={{ flex: 1 }}>
+                                            {msg.sharedContact.phone}
+                                          </a>
+                                        )}
+                                        <button
+                                          type="button"
+                                          className="chat-action-btn"
+                                          style={{ width: 28, height: 28 }}
+                                          aria-label={`Copy ${msg.sharedContact.name}'s phone number`}
+                                          onClick={() => {
+                                            const phone = msg.sharedContact?.phone;
+                                            if (phone) void handleCopyContactValue(phone);
+                                          }}
+                                        >
+                                          <Copy size={13} />
+                                        </button>
+                                      </div>
+                                    )}
+                                    {msg.sharedContact.email && (
+                                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 7 }}>
+                                        <Mail size={14} aria-hidden="true" />
+                                        {sharedContactEmailLink ? (
+                                          <a href={sharedContactEmailLink} style={{ flex: 1, overflowWrap: "anywhere" }}>
+                                            {msg.sharedContact.email}
+                                          </a>
+                                        ) : (
+                                          <span style={{ flex: 1, overflowWrap: "anywhere" }}>
+                                            {msg.sharedContact.email}
+                                          </span>
+                                        )}
+                                        <button
+                                          type="button"
+                                          className="chat-action-btn"
+                                          style={{ width: 28, height: 28 }}
+                                          aria-label={`Copy ${msg.sharedContact.name}'s email address`}
+                                          onClick={() => {
+                                            const email = msg.sharedContact?.email;
+                                            if (email) void handleCopyContactValue(email);
+                                          }}
+                                        >
+                                          <Copy size={13} />
+                                        </button>
+                                      </div>
+                                    )}
+                                    <button
+                                      type="button"
+                                      className="secondary-btn"
+                                      style={{ width: "100%", marginTop: 12 }}
+                                      onClick={() => {
+                                        const contact = msg.sharedContact;
+                                        if (contact) handleDownloadContactVCard(contact);
+                                      }}
+                                    >
+                                      Save contact
+                                    </button>
                                   </div>
                                 )}
 
@@ -2989,6 +3223,14 @@ export function ChatsView({
                           >
                             <FileText size={16} className="text-warning" />
                             <span>Document</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="attach-menu-item"
+                            onClick={handleOpenContactShareModal}
+                          >
+                            <UserIcon size={16} className="text-accent" />
+                            <span>Share contact</span>
                           </button>
                           <button
                             type="button"
@@ -3747,6 +3989,134 @@ export function ChatsView({
                     </div>
                   </div>
                 </div>
+              </div>
+            </div>
+          )}
+
+          {showContactShareModal && (
+            <div className="modal-backdrop" onClick={() => setShowContactShareModal(false)}>
+              <div
+                className="modal-card enhanced-chat-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="share-contact-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="new-chat-modal-header">
+                  <div className="new-chat-header-brand">
+                    <div className="new-chat-header-icon-wrap">
+                      <UserIcon size={20} />
+                    </div>
+                    <div>
+                      <h3 className="new-chat-title" id="share-contact-title">Share contact</h3>
+                      <p className="new-chat-subtitle">Choose the details to share with this conversation</p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    className="modal-close-btn"
+                    onClick={() => setShowContactShareModal(false)}
+                    aria-label="Close contact sharing"
+                  >
+                    <X size={18} />
+                  </button>
+                </div>
+                <form className="modal-body enhanced-modal-body" onSubmit={handleShareContact}>
+                  <button
+                    type="button"
+                    className="secondary-btn"
+                    style={{ width: "100%", marginBottom: 14 }}
+                    onClick={() => void handlePickDeviceContact()}
+                    disabled={isPickingDeviceContact}
+                  >
+                    {isPickingDeviceContact ? "Opening contacts..." : "Choose from device contacts"}
+                  </button>
+                  <label className="poll-create-field">
+                    <span className="poll-field-name">Name</span>
+                    <input
+                      className="enhanced-text-field"
+                      autoComplete="name"
+                      maxLength={120}
+                      required
+                      value={contactNameDraft}
+                      onChange={(event) => {
+                        setContactNameDraft(event.target.value);
+                        setContactShareError(null);
+                      }}
+                    />
+                  </label>
+                  <label className="poll-create-field">
+                    <span className="poll-field-name">Phone number</span>
+                    <input
+                      className="enhanced-text-field"
+                      type="tel"
+                      autoComplete="tel"
+                      maxLength={40}
+                      value={contactPhoneDraft}
+                      onChange={(event) => {
+                        setContactPhoneDraft(event.target.value);
+                        setContactShareError(null);
+                      }}
+                    />
+                  </label>
+                  <label className="poll-create-field">
+                    <span className="poll-field-name">Email address</span>
+                    <input
+                      className="enhanced-text-field"
+                      type="email"
+                      autoComplete="email"
+                      maxLength={254}
+                      value={contactEmailDraft}
+                      onChange={(event) => {
+                        setContactEmailDraft(event.target.value);
+                        setContactShareError(null);
+                      }}
+                    />
+                  </label>
+                  <div
+                    className="shared-contact-preview"
+                    aria-label="Contact card preview"
+                    style={{
+                      padding: 12,
+                      marginTop: 10,
+                      borderRadius: 10,
+                      background: "rgba(0, 168, 132, 0.08)",
+                      border: "1px solid rgba(0, 168, 132, 0.2)",
+                    }}
+                  >
+                    <strong>{contactNameDraft.trim() || "Contact name"}</strong>
+                    {contactPhoneDraft.trim() && <div>{contactPhoneDraft.trim()}</div>}
+                    {contactEmailDraft.trim() && <div>{contactEmailDraft.trim()}</div>}
+                    {!contactPhoneDraft.trim() && !contactEmailDraft.trim() && (
+                      <div style={{ opacity: 0.7 }}>Add a phone number or email address</div>
+                    )}
+                  </div>
+                  <p className="poll-field-hint">
+                    Only the details shown above will be shared with conversation members.
+                  </p>
+                  {contactShareError && (
+                    <p className="group-manage-error" role="alert">{contactShareError}</p>
+                  )}
+                  <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 16 }}>
+                    <button
+                      type="button"
+                      className="secondary-btn"
+                      onClick={() => setShowContactShareModal(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      className="primary-action-btn"
+                      disabled={
+                        !contactNameDraft.trim() ||
+                        (!contactPhoneDraft.trim() && !contactEmailDraft.trim())
+                      }
+                    >
+                      Share contact
+                    </button>
+                  </div>
+                </form>
               </div>
             </div>
           )}

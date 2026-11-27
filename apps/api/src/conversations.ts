@@ -45,6 +45,24 @@ const UpdateConversationLockSchema = z.object({
 const UpdateDisappearingTimerSchema = z.object({
   hours: z.number().int().min(0).max(720),
 });
+const SharedContactSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  phone: z.string().trim().min(3).max(40)
+    .regex(/^\+?[0-9().\-\s]+$/)
+    .refine((phone) => (phone.match(/\d/g)?.length ?? 0) >= 3)
+    .optional(),
+  email: z.string().trim().email().max(254).optional(),
+}).strict().refine((contact) => Boolean(contact.phone || contact.email));
+const MessageMetadataSchema = z.record(z.string(), z.unknown()).superRefine((metadata, context) => {
+  const sharedContact = metadata["sharedContact"];
+  if (sharedContact !== undefined && !SharedContactSchema.safeParse(sharedContact).success) {
+    context.addIssue({
+      code: "custom",
+      path: ["sharedContact"],
+      message: "Shared contact details are invalid.",
+    });
+  }
+});
 
 const CreateMessageSchema = z.object({
   id: z.string().uuid().optional(),
@@ -53,7 +71,8 @@ const CreateMessageSchema = z.object({
   attachments: z.array(z.record(z.string(), z.unknown())).optional(),
   voiceNote: z.record(z.string(), z.unknown()).optional(),
   replyToId: z.string().uuid().optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  metadata: MessageMetadataSchema.optional(),
+  sharedContact: SharedContactSchema.optional(),
 });
 const ScheduleMessageSchema = z.object({
   id: z.string().uuid(),
@@ -74,7 +93,7 @@ const ScheduleMessageSchema = z.object({
 
 const UpdateMessageSchema = z.object({
   text: z.string().max(4000).optional(),
-  metadata: z.record(z.string(), z.unknown()).optional(),
+  metadata: MessageMetadataSchema.optional(),
   attachments: z.array(z.record(z.string(), z.unknown())).nullable().optional(),
   voiceNote: z.record(z.string(), z.unknown()).nullable().optional(),
 }).refine((value) =>
@@ -1425,7 +1444,7 @@ export function createConversationsRouter(
     }
 
     if (!database) {
-      const { idempotencyKey, text, id, metadata } = parsed.data;
+      const { idempotencyKey, text, id, metadata, sharedContact } = parsed.data;
       const existingList = inMemoryMessages.get(conversationId) ?? [];
       const duplicate = idempotencyKey
         ? existingList.find((message) => message.idempotencyKey === idempotencyKey)
@@ -1443,7 +1462,11 @@ export function createConversationsRouter(
         text,
         createdAt: createdAt.toISOString(),
         status: "sent",
-        metadata: metadata ?? {},
+        metadata: {
+          ...(metadata ?? {}),
+          ...(sharedContact ? { sharedContact } : {}),
+        },
+        ...(sharedContact ? { sharedContact } : {}),
         ...(timerHours > 0
           ? { expiresAt: new Date(createdAt.getTime() + timerHours * 60 * 60 * 1000).toISOString() }
           : {}),
@@ -1459,7 +1482,7 @@ export function createConversationsRouter(
     try {
       const userId = await getUserId(request);
       await requireMembership(conversationId, userId);
-      const { id, text, idempotencyKey, attachments, voiceNote, replyToId, metadata } = parsed.data;
+      const { id, text, idempotencyKey, attachments, voiceNote, replyToId, metadata, sharedContact } = parsed.data;
       const normalizedAttachments = await normalizeR2Attachments(attachments, conversationId, userId);
       const inserted = await database.query<MessageRow>(
         `INSERT INTO app_messages
@@ -1482,7 +1505,10 @@ export function createConversationsRouter(
           voiceNote ? JSON.stringify(voiceNote) : null,
           replyToId ?? null,
           idempotencyKey ?? null,
-          JSON.stringify(metadata ?? {}),
+          JSON.stringify({
+            ...(metadata ?? {}),
+            ...(sharedContact ? { sharedContact } : {}),
+          }),
         ],
       );
 
@@ -1508,7 +1534,13 @@ export function createConversationsRouter(
             [conversationId],
           );
           const notificationBody = text.trim() ||
-            (voiceNote ? "Sent a voice message" : attachments?.length ? "Sent an attachment" : "New message");
+            (sharedContact
+              ? "Shared a contact"
+              : voiceNote
+                ? "Sent a voice message"
+                : attachments?.length
+                  ? "Sent an attachment"
+                  : "New message");
           for (const recipient of otherMembers.rows) {
             void notifyPushToUser(recipient.user_id, {
               type: "message",

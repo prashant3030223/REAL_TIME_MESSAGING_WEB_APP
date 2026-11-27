@@ -1141,7 +1141,7 @@ export function App() {
       return "pending";
     }
     try {
-      const { attachments, voiceNote, ...metadata } = message;
+      const { attachments, voiceNote, sharedContact, ...metadata } = message;
       const response = await fetch(`/api/conversations/${encodeURIComponent(message.conversationId)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1152,6 +1152,7 @@ export function App() {
           ...(attachments ? { attachments } : {}),
           ...(voiceNote ? { voiceNote } : {}),
           metadata,
+          ...(sharedContact ? { sharedContact } : {}),
         }),
       });
       const result = await response.json() as { message?: Partial<Message>; error?: { message?: string } };

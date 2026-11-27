@@ -44,6 +44,12 @@ export type PollData = {
   multipleAnswers?: boolean | undefined;
 };
 
+export type SharedContact = {
+  name: string;
+  phone?: string | undefined;
+  email?: string | undefined;
+};
+
 export type Message = {
   id: string;
   conversationId: string;
@@ -61,6 +67,7 @@ export type Message = {
   reactions?: Record<string, string[]> | undefined; // emoji -> array of userIds
   attachments?: Attachment[] | undefined;
   voiceNote?: VoiceNoteData | undefined;
+  sharedContact?: SharedContact | undefined;
   poll?: PollData | undefined;
   isPinned?: boolean | undefined;
   isStarred?: boolean | undefined;

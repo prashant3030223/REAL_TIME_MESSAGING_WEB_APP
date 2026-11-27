@@ -297,6 +297,58 @@ test("conversation disappearing timer validates and persists member settings", a
   });
 });
 
+test("shared contacts are validated and included in message history", async () => {
+  const peerUserId = "00000000-0000-4000-8000-000000000021";
+
+  await withServer(undefined, async (baseUrl) => {
+    const conversationResponse = await fetch(`${baseUrl}/api/conversations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Contact share", type: "direct", peerUserId }),
+    });
+    assert.equal(conversationResponse.status, 201);
+    const { conversation } = await conversationResponse.json() as { conversation: { id: string } };
+
+    const invalid = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "",
+        sharedContact: { name: "Invalid contact", phone: "javascript:alert(1)" },
+      }),
+    });
+    assert.equal(invalid.status, 400);
+
+    const invalidMetadata = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        text: "",
+        metadata: { sharedContact: { name: "Invalid contact", phone: "javascript:alert(1)" } },
+      }),
+    });
+    assert.equal(invalidMetadata.status, 400);
+
+    const contact = { name: "Riya Sharma", phone: "+1 (555) 010-2040", email: "riya@example.com" };
+    const sent = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "", sharedContact: contact }),
+    });
+    assert.equal(sent.status, 201);
+    assert.deepEqual(
+      (await sent.json() as { message: { sharedContact: typeof contact } }).message.sharedContact,
+      contact,
+    );
+
+    const historyResponse = await fetch(`${baseUrl}/api/conversations/${conversation.id}/messages`);
+    const history = (await historyResponse.json() as {
+      messages: Array<{ sharedContact?: typeof contact }>;
+    }).messages;
+    assert.deepEqual(history[0]?.sharedContact, contact);
+  });
+});
+
 test("core-contact auto-read sends a live read receipt", async () => {
   const sessionToken = randomBytes(32).toString("base64url");
   const userId = "00000000-0000-4000-8000-000000000001";
