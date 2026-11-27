@@ -10,6 +10,7 @@ test("due scheduled messages are persisted before realtime delivery", async () =
   const senderId = "00000000-0000-4000-8000-000000000003";
   const scheduledFor = new Date(Date.now() - 1_000).toISOString();
   const createdAt = new Date();
+  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
   const statements: string[] = [];
   let dueClaimed = false;
   let releaseCalled = false;
@@ -33,6 +34,7 @@ test("due scheduled messages are persisted before realtime delivery", async () =
             text: "Deliver this",
             metadata: { replyTo: { id: "reply-1", senderName: "Peer", text: "Previous" } },
             scheduled_for: scheduledFor,
+            disappearing_timer_hours: 24,
           }],
           rowCount: 1,
         };
@@ -44,7 +46,9 @@ test("due scheduled messages are persisted before realtime delivery", async () =
       if (query.includes("INSERT INTO app_messages")) {
         assert.deepEqual(values.slice(0, 4), [messageId, conversationId, senderId, "Deliver this"]);
         assert.ok(statements.includes("BEGIN"));
-        return { rows: [{ created_at: createdAt }], rowCount: 1 };
+        assert.equal(values[5], 24);
+        assert.match(query, /expires_at/);
+        return { rows: [{ created_at: createdAt, expires_at: expiresAt }], rowCount: 1 };
       }
       if (query.includes("UPDATE app_scheduled_messages")) {
         assert.deepEqual(values, [messageId]);
@@ -80,6 +84,7 @@ test("due scheduled messages are persisted before realtime delivery", async () =
   assert.equal(delivered?.["status"], "sent");
   assert.equal(delivered?.["senderId"], senderId);
   assert.equal(delivered?.["text"], "Deliver this");
+  assert.equal(delivered?.["expiresAt"], expiresAt.toISOString());
   assert.deepEqual(delivered?.["replyTo"], { id: "reply-1", senderName: "Peer", text: "Previous" });
 }
 );

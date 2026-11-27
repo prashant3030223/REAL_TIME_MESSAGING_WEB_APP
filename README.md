@@ -10,7 +10,7 @@
    - Real-time message exchange with status receipts (sent, delivered, read blue checkmarks).
    - Voice notes with interactive waveform playback and speed controls (1x, 1.5x, 2x).
    - Document & image attachments, emoji reaction bar (`❤️ 👍 🔥 😂 😮 👏`), and quote replies.
-   - Disappearing messages with configurable timers (24 hours, 7 days, 90 days).
+   - Per-conversation disappearing-message timers (off, 1 hour, 24 hours, 7 days, 30 days, or a custom duration up to 30 days); scheduled messages start their timer when delivered.
    - Scheduled message delivery and pinned messages.
 
 2. **Offline-First Resilience**:

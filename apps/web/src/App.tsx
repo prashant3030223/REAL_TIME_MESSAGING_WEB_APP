@@ -288,7 +288,9 @@ export function App() {
       visibleConversationId !== activeConversationId ||
       !activeConversationId
     ) return;
-    const activeMessages = messages[activeConversationId] ?? [];
+    const activeMessages = (messages[activeConversationId] ?? []).filter(
+      (message) => !message.expiresAt || Date.parse(message.expiresAt) > Date.now()
+    );
     const unreadIncoming = activeMessages.filter(
       (message) => message.senderId !== currentUser.id && message.status !== "read"
     );
@@ -902,6 +904,29 @@ export function App() {
       },
     );
 
+    const unsubDisappearing = realtime.subscribe(
+      "chat:disappearing",
+      (data: { conversationId?: string; hours?: number }) => {
+        if (
+          !data?.conversationId ||
+          !Number.isInteger(data.hours) ||
+          (data.hours as number) < 0 ||
+          (data.hours as number) > 720
+        ) return;
+        const timerHours = data.hours as number;
+        setConversations((previous) => {
+          const updated = previous.map((conversation) =>
+            conversation.id === data.conversationId
+              ? { ...conversation, disappearingTimerHours: timerHours }
+              : conversation
+          );
+          conversationsRef.current = updated;
+          storage.saveConversations(updated);
+          return updated;
+        });
+      },
+    );
+
     const unsubPin = realtime.subscribe("chat:pin", (data: { messageId: string; conversationId: string; isPinned: boolean }) => {
       if (!data?.messageId || !data?.conversationId || typeof data.isPinned !== "boolean") return;
       setMessages((prev) => {
@@ -1039,6 +1064,7 @@ export function App() {
       unsubDelivered();
       unsubDelete();
       unsubEdit();
+      unsubDisappearing();
       unsubPin();
       unsubReaction();
       unsubPollVote();
@@ -1779,6 +1805,34 @@ export function App() {
                     return updated;
                   });
                 }
+              }}
+              onSetDisappearingTimer={async (conversationId, hours) => {
+                const response = await fetch(
+                  `/api/conversations/${encodeURIComponent(conversationId)}/disappearing-timer`,
+                  {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ hours }),
+                  },
+                );
+                const result = await response.json() as {
+                  disappearingTimerHours?: number;
+                  error?: { message?: string };
+                };
+                if (!response.ok || result.disappearingTimerHours !== hours) {
+                  throw new Error(result.error?.message || "Could not update the disappearing-message timer.");
+                }
+                setConversations((previous) => {
+                  const updated = previous.map((conversation) =>
+                    conversation.id === conversationId
+                      ? { ...conversation, disappearingTimerHours: hours }
+                      : conversation
+                  );
+                  conversationsRef.current = updated;
+                  storage.saveConversations(updated);
+                  return updated;
+                });
+                realtime.send("chat:disappearing", { conversationId, hours }, conversationId);
               }}
               hasAppPin={Boolean(appPin)}
               onRequestAppPin={() => {

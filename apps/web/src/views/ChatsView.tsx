@@ -93,6 +93,7 @@ type ChatsViewProps = {
   onStartCall: (peerName: string, peerAvatar: string, isVideo: boolean, targetUserId?: string, targetPhone?: string) => void;
   onUnlockLockedChat: (conversationId: string) => void;
   onSetConversationLock: (conversationId: string, isLocked: boolean) => Promise<void>;
+  onSetDisappearingTimer: (conversationId: string, hours: number) => Promise<void>;
   hasAppPin: boolean;
   onRequestAppPin: () => void;
   currentUser: User;
@@ -361,6 +362,7 @@ export function ChatsView({
   onStartCall,
   onUnlockLockedChat,
   onSetConversationLock,
+  onSetDisappearingTimer,
   hasAppPin,
   onRequestAppPin,
   currentUser,
@@ -398,6 +400,9 @@ export function ChatsView({
   const [wallpaperLoadVersion, setWallpaperLoadVersion] = useState(0);
   const [wallpaperActionError, setWallpaperActionError] = useState<string | null>(null);
   const [wallpaperActionPending, setWallpaperActionPending] = useState(false);
+  const [disappearingTimerPending, setDisappearingTimerPending] = useState(false);
+  const [customDisappearingTimerHours, setCustomDisappearingTimerHours] = useState("1");
+  const [isCustomDisappearingTimerSelected, setIsCustomDisappearingTimerSelected] = useState(false);
   const [inputText, setInputText] = useState("");
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
@@ -543,6 +548,21 @@ export function ChatsView({
     ? customWallpaperObjectUrl.url
     : null;
   const allActiveMessages = activeConv ? messages[activeConv.id] ?? [] : [];
+  useEffect(() => {
+    const now = Date.now();
+    const nextExpiry = allActiveMessages.reduce<number | null>((nearest, message) => {
+      if (!message.expiresAt) return nearest;
+      const expiresAt = Date.parse(message.expiresAt);
+      if (expiresAt <= now) return nearest;
+      return nearest === null ? expiresAt : Math.min(nearest, expiresAt);
+    }, null);
+    if (nextExpiry === null) return;
+    const timer = window.setTimeout(
+      () => setLastSeenClock(Date.now()),
+      Math.max(0, nextExpiry - now),
+    );
+    return () => window.clearTimeout(timer);
+  }, [allActiveMessages]);
   const activePeerTyping = activeConv ? peerTyping[activeConv.id] : undefined;
   const minimumScheduledDateTime = formatDateTimeLocal(new Date(Date.now() + 60_000));
   const hasValidScheduledDateTime = Boolean(
@@ -594,9 +614,20 @@ export function ChatsView({
     }
   }, [activeConversationId]);
 
+  useEffect(() => {
+    const timerHours = activeConv?.disappearingTimerHours ?? 0;
+    const isCustomTimer = timerHours > 0 && ![1, 24, 168, 720].includes(timerHours);
+    setIsCustomDisappearingTimerSelected(isCustomTimer);
+    setCustomDisappearingTimerHours(
+      isCustomTimer ? String(timerHours) : "1"
+    );
+  }, [activeConv?.id, activeConv?.disappearingTimerHours]);
+
   // Filter out messages deleted for current user
   const activeMessages = allActiveMessages.filter(
-    (m) => !m.deletedForUserIds?.includes(currentUser.id)
+    (m) =>
+      !m.deletedForUserIds?.includes(currentUser.id) &&
+      (!m.expiresAt || Date.parse(m.expiresAt) > Date.now())
   );
   const pinnedMessage = activeMessages.find((message) => message.isPinned);
 
@@ -1743,6 +1774,23 @@ export function ChatsView({
         window.setTimeout(() => setCopiedToast(null), 3000);
       })
       .finally(() => setIsUpdatingChatLock(false));
+  }
+
+  function handleSetDisappearingTimer(hours: number) {
+    if (!activeConv || disappearingTimerPending) return;
+    setDisappearingTimerPending(true);
+    void onSetDisappearingTimer(activeConv.id, hours)
+      .then(() => {
+        setCopiedToast(hours === 0
+          ? "Disappearing messages turned off."
+          : `New messages will disappear after ${hours % 24 === 0 ? `${hours / 24} days` : `${hours} hours`}.`);
+        window.setTimeout(() => setCopiedToast(null), 3000);
+      })
+      .catch((error: unknown) => {
+        setCopiedToast(error instanceof Error ? error.message : "Could not update the disappearing-message timer.");
+        window.setTimeout(() => setCopiedToast(null), 3000);
+      })
+      .finally(() => setDisappearingTimerPending(false));
   }
 
   function handleReadAloud(text: string) {
@@ -3281,6 +3329,69 @@ export function ChatsView({
                       </div>
                     </>
                   )}
+                  <div className="wa-drawer-section">
+                    <div className="wa-drawer-section-title">Disappearing messages</div>
+                    <p className="chat-wallpaper-description">
+                      The timer applies to new messages after they are sent.
+                    </p>
+                    <select
+                      className="enhanced-text-field"
+                      aria-label="Disappearing-message timer"
+                      value={
+                        isCustomDisappearingTimerSelected ||
+                        ![0, 1, 24, 168, 720].includes(activeConv.disappearingTimerHours ?? 0)
+                          ? "custom"
+                          : String(activeConv.disappearingTimerHours ?? 0)
+                      }
+                      disabled={disappearingTimerPending}
+                      onChange={(event) => {
+                        if (event.target.value === "custom") {
+                          setIsCustomDisappearingTimerSelected(true);
+                          return;
+                        }
+                        setIsCustomDisappearingTimerSelected(false);
+                        handleSetDisappearingTimer(Number(event.target.value));
+                      }}
+                    >
+                      <option value="0">Off</option>
+                      <option value="1">After 1 hour</option>
+                      <option value="24">After 24 hours</option>
+                      <option value="168">After 7 days</option>
+                      <option value="720">After 30 days</option>
+                      <option value="custom">Custom duration</option>
+                    </select>
+                    {(isCustomDisappearingTimerSelected ||
+                      ![0, 1, 24, 168, 720].includes(activeConv.disappearingTimerHours ?? 0)) && (
+                      <div className="wa-drawer-toggle-row" style={{ marginTop: 10 }}>
+                        <label htmlFor="custom-disappearing-timer-hours">Hours (1–720)</label>
+                        <input
+                          id="custom-disappearing-timer-hours"
+                          className="enhanced-text-field"
+                          type="number"
+                          min={1}
+                          max={720}
+                          step={1}
+                          value={customDisappearingTimerHours}
+                          disabled={disappearingTimerPending}
+                          onChange={(event) => setCustomDisappearingTimerHours(event.target.value)}
+                        />
+                        <button
+                          type="button"
+                          className="secondary-btn"
+                          disabled={
+                            disappearingTimerPending ||
+                            !Number.isInteger(Number(customDisappearingTimerHours)) ||
+                            Number(customDisappearingTimerHours) < 1 ||
+                            Number(customDisappearingTimerHours) > 720 ||
+                            Number(customDisappearingTimerHours) === activeConv.disappearingTimerHours
+                          }
+                          onClick={() => handleSetDisappearingTimer(Number(customDisappearingTimerHours))}
+                        >
+                          {disappearingTimerPending ? "Saving..." : "Save"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
                   <div className="wa-drawer-section">
                     {activeConv.type !== "group" && (
                       <div className="wa-drawer-toggle-row">

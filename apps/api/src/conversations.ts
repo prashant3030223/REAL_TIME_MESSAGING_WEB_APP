@@ -27,6 +27,7 @@ const CreateConversationSchema = z.object({
   peerUserId: z.string().uuid().optional(),
   memberIds: z.array(z.string().uuid()).max(100).default([]),
 });
+
 const AddMembersSchema = z.object({
   memberIds: z.array(z.string().uuid()).min(1).max(100),
 });
@@ -40,6 +41,9 @@ const UpdateMemberRoleSchema = z.object({
 });
 const UpdateConversationLockSchema = z.object({
   isLocked: z.boolean(),
+});
+const UpdateDisappearingTimerSchema = z.object({
+  hours: z.number().int().min(0).max(720),
 });
 
 const CreateMessageSchema = z.object({
@@ -136,6 +140,7 @@ type MessageRow = {
   status: "pending" | "sent" | "delivered" | "read";
   metadata: Record<string, unknown>;
   created_at: Date | string;
+  expires_at?: Date | string | null;
 };
 
 type ScheduledMessageRow = {
@@ -196,6 +201,7 @@ function toMessage(row: MessageRow) {
     text: row.text,
     timestamp: new Date(row.created_at).toISOString(),
     status: row.status,
+    ...(row.expires_at ? { expiresAt: new Date(row.expires_at).toISOString() } : {}),
     ...(row.attachments ? { attachments: row.attachments } : {}),
     ...(row.voice_note ? { voiceNote: row.voice_note } : {}),
   };
@@ -223,6 +229,7 @@ export function createConversationsRouter(
     name: string;
     description: string;
     avatar: string;
+    disappearingTimerHours: number;
     createdAt: string;
     updatedAt: string;
   }> = [];
@@ -234,6 +241,7 @@ export function createConversationsRouter(
     status: string;
     metadata: Record<string, unknown>;
     idempotencyKey?: string;
+    expiresAt?: string;
   }>>();
   const inMemoryScheduledMessages = new Map<string, InMemoryScheduledMessage[]>();
   let inMemoryScheduleTimer: NodeJS.Timeout | null = null;
@@ -247,11 +255,18 @@ export function createConversationsRouter(
         const pending = scheduledMessages.filter((message) => Date.parse(message.scheduledFor) > now);
         const due = scheduledMessages.filter((message) => Date.parse(message.scheduledFor) <= now);
         for (const message of due) {
-          const timestamp = new Date().toISOString();
+          const createdAt = new Date();
+          const timestamp = createdAt.toISOString();
+          const timerHours = inMemoryConversations.find((conversation) => conversation.id === conversationId)
+            ?.disappearingTimerHours ?? 0;
+          const expiresAt = timerHours > 0
+            ? new Date(createdAt.getTime() + timerHours * 60 * 60 * 1000).toISOString()
+            : undefined;
           const delivered: ScheduledMessagePayload = {
             ...message,
             timestamp,
             status: "sent",
+            ...(expiresAt ? { expiresAt } : {}),
           };
           const conversationMessages = inMemoryMessages.get(conversationId) ?? [];
           conversationMessages.push({
@@ -261,6 +276,7 @@ export function createConversationsRouter(
             createdAt: timestamp,
             status: "sent",
             metadata: delivered,
+            ...(expiresAt ? { expiresAt } : {}),
           });
           inMemoryMessages.set(conversationId, conversationMessages);
           if (notifyScheduledMessage) {
@@ -609,9 +625,11 @@ export function createConversationsRouter(
         last_message_status: MessageRow["status"] | null;
         last_message_metadata: Record<string, unknown> | null;
         last_message_created_at: Date | string | null;
+        last_message_expires_at: Date | string | null;
+        disappearing_timer_hours: number;
         updated_at: Date | string;
       }>(
-        `SELECT c.id, c.type, c.name, c.description, c.avatar, c.updated_at,
+        `SELECT c.id, c.type, c.name, c.description, c.avatar, c.disappearing_timer_hours, c.updated_at,
                 own.role AS current_user_role, own.is_locked, group_members.members,
                 peer.id AS peer_user_id, peer.display_name AS peer_name,
                 peer.avatar AS peer_avatar, peer.phone AS peer_phone,
@@ -621,7 +639,7 @@ export function createConversationsRouter(
                 sender.avatar AS last_message_sender_avatar, latest.text AS last_message_text,
                 latest.attachments AS last_message_attachments, latest.voice_note AS last_message_voice_note,
                 latest.status AS last_message_status, latest.metadata AS last_message_metadata,
-                latest.created_at AS last_message_created_at
+                latest.created_at AS last_message_created_at, latest.expires_at AS last_message_expires_at
          FROM app_conversation_members own
          JOIN app_conversations c ON c.id = own.conversation_id
          LEFT JOIN LATERAL (
@@ -647,6 +665,7 @@ export function createConversationsRouter(
            SELECT m.*
            FROM app_messages m
            WHERE m.conversation_id = c.id
+             AND (m.expires_at IS NULL OR m.expires_at > now())
            ORDER BY m.created_at DESC
            LIMIT 1
          ) latest ON true
@@ -679,6 +698,7 @@ export function createConversationsRouter(
         avatar: row.type === "direct" ? row.peer_avatar ?? row.avatar ?? "" : row.avatar ?? "",
         currentUserRole: row.current_user_role,
         isLocked: row.is_locked,
+        disappearingTimerHours: row.disappearing_timer_hours,
         ...(row.members ? { members: row.members } : {}),
         ...(row.peer_user_id ? { peerUserId: row.peer_user_id } : {}),
         ...(row.peer_phone ? { peerPhone: row.peer_phone } : {}),
@@ -700,6 +720,7 @@ export function createConversationsRouter(
             status: row.last_message_status!,
             metadata: row.last_message_metadata ?? {},
             created_at: row.last_message_created_at!,
+            expires_at: row.last_message_expires_at,
           }),
         } : {}),
       }));
@@ -874,6 +895,7 @@ export function createConversationsRouter(
       name,
       description,
       avatar: avatar || "/avatars/boy.png",
+      disappearingTimerHours: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       ...(peerUserId ? { peerUserId } : {}),
@@ -955,6 +977,50 @@ export function createConversationsRouter(
         return;
       }
       response.status(200).json({ isLocked: row.is_locked });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.patch("/:id/disappearing-timer", async (request, response, next) => {
+    const conversationId = request.params["id"] ?? "";
+    const parsed = UpdateDisappearingTimerSchema.safeParse(request.body);
+    if (!parsed.success) {
+      next(new ApiError(400, "INVALID_DISAPPEARING_TIMER", "Choose a timer between off and 30 days."));
+      return;
+    }
+
+    if (!database) {
+      const conversation = inMemoryConversations.find((item) => item.id === conversationId);
+      if (!conversation) {
+        next(new ApiError(404, "CONVERSATION_NOT_FOUND", "Conversation not found."));
+        return;
+      }
+      conversation.disappearingTimerHours = parsed.data.hours;
+      response.status(200).json({ disappearingTimerHours: conversation.disappearingTimerHours });
+      return;
+    }
+
+    try {
+      const userId = await getUserId(request);
+      await requireMembership(conversationId, userId);
+      const updated = await database.query<{ disappearing_timer_hours: number }>(
+        `UPDATE app_conversations
+         SET disappearing_timer_hours = $3, updated_at = now()
+         WHERE id = $1
+           AND EXISTS (
+             SELECT 1 FROM app_conversation_members member
+             WHERE member.conversation_id = app_conversations.id AND member.user_id = $2
+           )
+         RETURNING disappearing_timer_hours`,
+        [conversationId, userId, parsed.data.hours],
+      );
+      const timerHours = updated.rows[0]?.disappearing_timer_hours;
+      if (timerHours === undefined) {
+        next(new ApiError(404, "CONVERSATION_NOT_FOUND", "Conversation not found."));
+        return;
+      }
+      response.status(200).json({ disappearingTimerHours: timerHours });
     } catch (error) {
       next(error);
     }
@@ -1129,7 +1195,7 @@ export function createConversationsRouter(
         ...metadata,
         ...message,
         timestamp: typeof metadata["timestamp"] === "string" ? metadata["timestamp"] : message.createdAt,
-      }));
+      })).filter((message) => !message.expiresAt || Date.parse(message.expiresAt) > Date.now());
       const scheduledMessages = inMemoryScheduledMessages.get(conversationId) ?? [];
       response.status(200).json({
         messages: [...messages, ...scheduledMessages].sort(
@@ -1145,15 +1211,17 @@ export function createConversationsRouter(
       const result = await database.query<MessageRow>(
         `SELECT m.id, m.conversation_id, m.sender_id, u.display_name AS sender_name,
                 u.avatar AS sender_avatar, m.text, m.attachments, m.voice_note,
-                m.status, m.metadata, m.created_at
+               m.status, m.metadata, m.created_at, m.expires_at
          FROM app_messages m
          JOIN app_users u ON u.id = m.sender_id
          WHERE m.conversation_id = $1
+           AND (m.expires_at IS NULL OR m.expires_at > now())
            AND (
              m.id IN (
                SELECT recent.id
                FROM app_messages recent
                WHERE recent.conversation_id = $1
+                 AND (recent.expires_at IS NULL OR recent.expires_at > now())
                ORDER BY recent.created_at DESC
                LIMIT 100
              )
@@ -1366,13 +1434,19 @@ export function createConversationsRouter(
         response.status(200).json({ message: duplicate, duplicate: true });
         return;
       }
+      const timerHours = inMemoryConversations.find((conversation) => conversation.id === conversationId)
+        ?.disappearingTimerHours ?? 0;
+      const createdAt = new Date();
       const message = {
         id: id ?? randomUUID(),
         conversationId,
         text,
-        createdAt: new Date().toISOString(),
+        createdAt: createdAt.toISOString(),
         status: "sent",
         metadata: metadata ?? {},
+        ...(timerHours > 0
+          ? { expiresAt: new Date(createdAt.getTime() + timerHours * 60 * 60 * 1000).toISOString() }
+          : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
       };
       existingList.push(message);
@@ -1389,10 +1463,16 @@ export function createConversationsRouter(
       const normalizedAttachments = await normalizeR2Attachments(attachments, conversationId, userId);
       const inserted = await database.query<MessageRow>(
         `INSERT INTO app_messages
-           (id, conversation_id, sender_id, text, attachments, voice_note, reply_to_id, idempotency_key, metadata)
-         VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9)
+         (id, conversation_id, sender_id, text, attachments, voice_note, reply_to_id, idempotency_key, metadata, expires_at)
+         VALUES (
+         COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9,
+         (SELECT CASE WHEN disappearing_timer_hours > 0
+           THEN now() + make_interval(hours => disappearing_timer_hours)
+           ELSE NULL END
+          FROM app_conversations WHERE id = $2)
+         )
          ON CONFLICT (conversation_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-         RETURNING id, conversation_id, sender_id, text, attachments, voice_note, status, metadata, created_at`,
+         RETURNING id, conversation_id, sender_id, text, attachments, voice_note, status, metadata, created_at, expires_at`,
         [
           id ?? null,
           conversationId,

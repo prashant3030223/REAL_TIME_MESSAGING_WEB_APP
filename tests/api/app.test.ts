@@ -238,6 +238,62 @@ test("database-backed conversations and messages require an authenticated sessio
     );
     assert.equal(scheduledMessage.status, 401);
     assert.equal((await scheduledMessage.json() as { error: { code: string } }).error.code, "UNAUTHENTICATED");
+
+    const timer = await fetch(
+      `${baseUrl}/api/conversations/00000000-0000-4000-8000-000000000001/disappearing-timer`,
+      {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ hours: 24 }),
+      },
+    );
+    assert.equal(timer.status, 401);
+  });
+});
+
+test("conversation disappearing timer validates and persists member settings", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const userId = "00000000-0000-4000-8000-000000000011";
+  const conversationId = "00000000-0000-4000-8000-000000000012";
+  const statements: string[] = [];
+  const database = {
+    query: async (sql: string, values: unknown[] = []) => {
+      statements.push(sql);
+      if (sql.includes("SELECT user_id FROM app_sessions")) return { rows: [{ user_id: userId }] };
+      if (sql.includes("SELECT 1 FROM app_conversation_members own")) {
+        return { rows: [{ "?column?": 1 }], rowCount: 1 };
+      }
+      if (sql.includes("UPDATE app_conversations") && sql.includes("disappearing_timer_hours")) {
+        assert.deepEqual(values, [conversationId, userId, 168]);
+        return { rows: [{ disappearing_timer_hours: 168 }], rowCount: 1 };
+      }
+      throw new Error(`Unexpected disappearing-timer query: ${sql}`);
+    },
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const endpoint = `${baseUrl}/api/conversations/${conversationId}/disappearing-timer`;
+    const invalid = await fetch(endpoint, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+      },
+      body: JSON.stringify({ hours: 721 }),
+    });
+    assert.equal(invalid.status, 400);
+
+    const response = await fetch(endpoint, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+      },
+      body: JSON.stringify({ hours: 168 }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { disappearingTimerHours: 168 });
+    assert.ok(statements.some((sql) => sql.includes("UPDATE app_conversations")));
   });
 });
 
@@ -264,6 +320,7 @@ test("core-contact auto-read sends a live read receipt", async () => {
         return { rows: [{ "?column?": 1 }], rowCount: 1 };
       }
       if (sql.includes("INSERT INTO app_messages") && sql.includes("RETURNING id, conversation_id")) {
+        assert.match(sql, /make_interval\(hours => disappearing_timer_hours\)/);
         return {
           rows: [{
             id: messageId,
@@ -275,6 +332,7 @@ test("core-contact auto-read sends a live read receipt", async () => {
             status: "sent",
             metadata: {},
             created_at: new Date(),
+            expires_at: new Date(Date.now() + 60 * 60 * 1000),
           }],
         };
       }
@@ -305,6 +363,8 @@ test("core-contact auto-read sends a live read receipt", async () => {
       body: JSON.stringify({ id: messageId, text: "Hello" }),
     });
     assert.equal(response.status, 201);
+    const savedMessage = (await response.json() as { message: Record<string, unknown> }).message;
+    assert.equal(typeof savedMessage.expiresAt, "string");
 
     let receiptTimeout: ReturnType<typeof setTimeout> | undefined;
     const receipt = await Promise.race([
@@ -527,6 +587,7 @@ test("scheduled messages require authentication, persist for the sender, and can
         return { rows: [stored], rowCount: 1 };
       }
       if (query.includes("FROM app_messages m")) {
+        assert.match(query, /m\.expires_at IS NULL OR m\.expires_at > now\(\)/);
         return { rows: [], rowCount: 0 };
       }
       if (query.includes("FROM app_scheduled_messages scheduled") && query.includes("state = 'scheduled'")) {

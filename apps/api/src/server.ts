@@ -9,6 +9,7 @@ import { parseConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { createRealtimeGateway } from "./realtime.js";
 import { createScheduledMessageScheduler } from "./scheduledMessages.js";
+import { createMessageExpiryScheduler } from "./messageExpiry.js";
 import { createR2AttachmentStorage } from "./objectStorage.js";
 import { createPushDelivery } from "./push.js";
 import { applyDatabaseMigrations } from "./db/migrate.js";
@@ -60,6 +61,9 @@ const realtimeGateway = createRealtimeGateway(
 const scheduledMessageScheduler = database
   ? createScheduledMessageScheduler(database, realtimeGateway.broadcastScheduledMessage, logger)
   : undefined;
+const messageExpiryScheduler = database
+  ? createMessageExpiryScheduler(database, attachmentStorage, logger)
+  : undefined;
 
 const app = createApp({
   logger,
@@ -100,6 +104,7 @@ async function shutdown(signal: string) {
   forceTimeout.unref();
 
   await scheduledMessageScheduler?.shutdown();
+  await messageExpiryScheduler?.shutdown();
   realtimeGateway.shutdown();
   server.closeIdleConnections?.();
   await new Promise<void>((resolve) => {

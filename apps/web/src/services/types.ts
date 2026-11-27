@@ -70,6 +70,7 @@ export type Message = {
   scheduledFor?: string | undefined;
   linkPreviewDisabled?: boolean | undefined;
   expiresInSeconds?: number | undefined;
+  expiresAt?: string | undefined;
   targetUserId?: string | undefined;
   targetPhone?: string | undefined;
 };

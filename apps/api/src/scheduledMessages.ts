@@ -23,6 +23,7 @@ type DueScheduledMessage = {
   text: string;
   metadata: Record<string, unknown>;
   scheduled_for: Date | string;
+  disappearing_timer_hours: number;
 };
 
 export async function processDueScheduledMessages(
@@ -44,9 +45,11 @@ export async function processDueScheduledMessages(
       const due = await client.query<DueScheduledMessage>(
         `SELECT scheduled.id, scheduled.conversation_id, scheduled.sender_id,
                 sender.display_name AS sender_name, sender.avatar AS sender_avatar,
-                scheduled.text, scheduled.metadata, scheduled.scheduled_for
+                scheduled.text, scheduled.metadata, scheduled.scheduled_for,
+                conversation.disappearing_timer_hours
          FROM app_scheduled_messages scheduled
          JOIN app_users sender ON sender.id = scheduled.sender_id
+         JOIN app_conversations conversation ON conversation.id = scheduled.conversation_id
          WHERE scheduled.state = 'scheduled' AND scheduled.scheduled_for <= now()
          ORDER BY scheduled.scheduled_for, scheduled.created_at
          LIMIT 1
@@ -74,17 +77,21 @@ export async function processDueScheduledMessages(
         continue;
       }
 
-      const inserted = await client.query<{ created_at: Date | string }>(
+      const inserted = await client.query<{ created_at: Date | string; expires_at: Date | string | null }>(
         `INSERT INTO app_messages
-           (id, conversation_id, sender_id, text, reply_to_id, status, metadata)
-         VALUES ($1, $2, $3, $4, NULL, 'sent', $5)
-         RETURNING created_at`,
+           (id, conversation_id, sender_id, text, reply_to_id, status, metadata, expires_at)
+         VALUES (
+           $1, $2, $3, $4, NULL, 'sent', $5,
+           CASE WHEN $6 > 0 THEN now() + make_interval(hours => $6) ELSE NULL END
+         )
+         RETURNING created_at, expires_at`,
         [
           message.id,
           message.conversation_id,
           message.sender_id,
           message.text,
           JSON.stringify(message.metadata),
+          message.disappearing_timer_hours,
         ],
       );
       const createdAt = inserted.rows[0]?.created_at;
@@ -104,6 +111,9 @@ export async function processDueScheduledMessages(
         timestamp: new Date(createdAt).toISOString(),
         status: "sent",
         scheduledFor,
+        ...(inserted.rows[0]?.expires_at
+          ? { expiresAt: new Date(inserted.rows[0].expires_at).toISOString() }
+          : {}),
       };
 
       await client.query(

@@ -11,6 +11,7 @@ type RealtimeEventType =
   | "chat:read"
   | "chat:typing"
   | "chat:edit"
+  | "chat:disappearing"
   | "chat:delete"
   | "chat:pin"
   | "chat:reaction"

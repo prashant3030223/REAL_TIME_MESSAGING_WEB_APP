@@ -471,6 +471,29 @@ export function createRealtimeGateway(
             break;
           }
 
+          case "chat:disappearing": {
+            if (!msg.conversationId || !client.userId) break;
+            const hours = msg.payload?.hours;
+            if (!Number.isInteger(hours) || hours < 0 || hours > 720) break;
+            if (database) {
+              const setting = await database.query<{ disappearing_timer_hours: number }>(
+                `SELECT conversation.disappearing_timer_hours
+                 FROM app_conversations conversation
+                 JOIN app_conversation_members member
+                   ON member.conversation_id = conversation.id
+                 WHERE conversation.id = $1 AND member.user_id = $2`,
+                [msg.conversationId, client.userId],
+              );
+              const timerHours = setting.rows[0]?.disappearing_timer_hours;
+              if (timerHours === undefined) break;
+              msg.payload = { conversationId: msg.conversationId, hours: timerHours };
+              await broadcastToConversation(msg, msg.conversationId, client.userId, clientId);
+            } else {
+              broadcast(msg, clientId);
+            }
+            break;
+          }
+
           case "chat:message": {
             if (database) {
               const conversationId = msg.conversationId;
