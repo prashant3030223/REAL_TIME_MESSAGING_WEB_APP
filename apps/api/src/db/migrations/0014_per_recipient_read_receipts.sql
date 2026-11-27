@@ -1,7 +1,7 @@
 ALTER TABLE app_users
   ADD COLUMN IF NOT EXISTS read_receipts_enabled boolean NOT NULL DEFAULT true;
 
-CREATE TABLE app_message_receipts (
+CREATE TABLE IF NOT EXISTS app_message_receipts (
   message_id uuid NOT NULL REFERENCES app_messages(id) ON DELETE CASCADE,
   user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
   delivered_at timestamptz,
