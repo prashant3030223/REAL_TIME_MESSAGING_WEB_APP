@@ -1589,12 +1589,26 @@ export function App() {
   }
 
   if (isCheckingSession) {
-    return <main className="auth-loading" role="status">Checking your session...</main>;
+    return (
+      <main className="session-loading" role="status" aria-label="Checking your session">
+        <div className="session-loading-content">
+          <div className="session-loading-brand">
+            <span>Connect</span>Sphere
+          </div>
+          <div className="session-loading-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </div>
+          <p>Checking your session</p>
+        </div>
+      </main>
+    );
   }
 
   if (sessionCheckError) {
     return (
-      <main className="auth-loading" role="alert">
+      <main className="session-loading session-loading-error" role="alert">
         <p>{sessionCheckError}</p>
         <button type="button" onClick={() => window.location.reload()}>Try again</button>
       </main>
