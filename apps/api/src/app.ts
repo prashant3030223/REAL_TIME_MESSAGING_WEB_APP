@@ -16,6 +16,8 @@ import type { R2AttachmentStorage } from "./objectStorage.js";
 import type { ScheduledMessagePayload } from "./scheduledMessages.js";
 import { createPushRouter } from "./push.js";
 import type { PushNotificationPayload } from "./push.js";
+import { createLinkPreviewsRouter } from "./linkPreviews.js";
+import type { LinkPreviewFetcher } from "./linkPreviews.js";
 
 export type AppDependencies = {
   logger: AppLogger;
@@ -35,6 +37,7 @@ export type AppDependencies = {
   corsOrigin?: string;
   trustProxy?: boolean | number | string;
   attachmentStorage?: R2AttachmentStorage;
+  linkPreviewFetcher?: LinkPreviewFetcher;
 };
 
 export function createApp({
@@ -50,6 +53,7 @@ export function createApp({
   corsOrigin,
   trustProxy,
   attachmentStorage,
+  linkPreviewFetcher,
 }: AppDependencies) {
   const app = express();
   app.disable("x-powered-by");
@@ -175,6 +179,7 @@ export function createApp({
       notifyPushToUser,
     ),
   );
+  app.use("/api/link-previews", createLinkPreviewsRouter(database, logger, linkPreviewFetcher));
   app.use("/api/calls", createCallsRouter(database, logger));
   app.use("/api/connections", createConnectionsRouter(database, logger));
   app.use("/api/push", createPushRouter(database, logger, pushDelivery));

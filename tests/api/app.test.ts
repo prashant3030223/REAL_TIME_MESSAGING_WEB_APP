@@ -11,6 +11,7 @@ import type { Pool } from "pg";
 import pino from "pino";
 import { createApp } from "../../apps/api/src/app.js";
 import { SESSION_COOKIE_NAME } from "../../apps/api/src/auth.js";
+import type { LinkPreviewFetcher } from "../../apps/api/src/linkPreviews.js";
 import type { R2AttachmentStorage } from "../../apps/api/src/objectStorage.js";
 
 async function withServer(
@@ -29,6 +30,7 @@ async function withServer(
     }) => Promise<void>;
     pushDelivery?: { isConfigured: boolean; publicKey: string | null };
     attachmentStorage?: R2AttachmentStorage;
+    linkPreviewFetcher?: LinkPreviewFetcher;
   } = {},
 ) {
   const logger = pino({ enabled: false });
@@ -52,6 +54,51 @@ test("liveness endpoint returns a request ID and healthy response", async () => 
     assert.match(response.headers.get("x-request-id") ?? "", /^[0-9a-f-]{36}$/);
     assert.deepEqual(await response.json(), { status: "ok" });
   });
+});
+
+test("link previews require a session and return fetched metadata", async () => {
+  let fetchedUrl: string | null = null;
+  let fetchCount = 0;
+  const database = {
+    query: async () => ({ rows: [{ user_id: "00000000-0000-4000-8000-000000000001" }] }),
+  } as unknown as Pool;
+  const linkPreviewFetcher: LinkPreviewFetcher = async (url) => {
+    fetchedUrl = url;
+    fetchCount += 1;
+    return {
+      url,
+      hostname: "example.com",
+      title: "Example",
+      description: "An example website.",
+    };
+  };
+
+  await withServer(database, async (baseUrl) => {
+    const url = "https://example.com/article";
+    const unauthorized = await fetch(`${baseUrl}/api/link-previews?url=${encodeURIComponent(url)}`);
+    assert.equal(unauthorized.status, 401);
+
+    const authorized = await fetch(`${baseUrl}/api/link-previews?url=${encodeURIComponent(url)}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${"a".repeat(43)}` },
+    });
+    assert.equal(authorized.status, 200);
+    assert.deepEqual(await authorized.json(), {
+      preview: {
+        url,
+        hostname: "example.com",
+        title: "Example",
+        description: "An example website.",
+      },
+    });
+    assert.equal(fetchedUrl, url);
+    assert.equal(authorized.headers.get("cache-control"), "private, no-store");
+
+    const invalid = await fetch(`${baseUrl}/api/link-previews?url=${encodeURIComponent("file://example.com/secret")}`, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${"a".repeat(43)}` },
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(fetchCount, 1);
+  }, { linkPreviewFetcher });
 });
 
 test("reopening the same direct chat reuses one conversation", async () => {

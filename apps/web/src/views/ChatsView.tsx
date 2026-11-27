@@ -134,7 +134,13 @@ function createPollOptionDraft(): PollOptionDraft {
 type LinkPreview = {
   url: string;
   hostname: string;
+  title?: string;
+  description?: string;
+  thumbnail?: string;
 };
+
+const resolvedLinkPreviews = new Map<string, { expiresAt: number; preview: LinkPreview }>();
+const pendingLinkPreviews = new Map<string, Promise<LinkPreview>>();
 
 function getLinkPreview(text: string): LinkPreview | null {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
@@ -150,6 +156,55 @@ function getLinkPreview(text: string): LinkPreview | null {
   } catch {
     return null;
   }
+}
+
+function getLinkPreviews(text: string): LinkPreview[] {
+  const previews: LinkPreview[] = [];
+  const seen = new Set<string>();
+  const urlPattern = /https?:\/\/[^\s<>"']+/gi;
+  for (const match of text.matchAll(urlPattern)) {
+    const candidate = match[0].replace(/[),.!?;:]+$/g, "");
+    const preview = getLinkPreview(candidate);
+    if (preview && !seen.has(preview.url)) {
+      seen.add(preview.url);
+      previews.push(preview);
+    }
+  }
+  return previews;
+}
+
+function fetchLinkPreview(url: string): Promise<LinkPreview> {
+  const cached = resolvedLinkPreviews.get(url);
+  if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.preview);
+  if (cached) resolvedLinkPreviews.delete(url);
+
+  const pending = pendingLinkPreviews.get(url);
+  if (pending) return pending;
+
+  const request = fetch(`/api/link-previews?url=${encodeURIComponent(url)}`)
+    .then(async (response) => {
+      if (!response.ok) throw new Error("Could not load preview metadata.");
+      const body = await response.json() as { preview?: LinkPreview };
+      if (
+        !body.preview ||
+        typeof body.preview.title !== "string" ||
+        typeof body.preview.description !== "string"
+      ) {
+        throw new Error("Preview metadata was invalid.");
+      }
+      if (resolvedLinkPreviews.size >= 100) {
+        const oldestUrl = resolvedLinkPreviews.keys().next().value;
+        if (oldestUrl) resolvedLinkPreviews.delete(oldestUrl);
+      }
+      resolvedLinkPreviews.set(url, {
+        expiresAt: Date.now() + 10 * 60 * 1000,
+        preview: body.preview,
+      });
+      return body.preview;
+    })
+    .finally(() => pendingLinkPreviews.delete(url));
+  pendingLinkPreviews.set(url, request);
+  return request;
 }
 
 function renderMessageLinks(text: string): ReactNode {
@@ -195,10 +250,71 @@ function LinkPreviewCard({
   className: string;
   onDismiss?: () => void;
 }) {
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const [metadata, setMetadata] = useState<LinkPreview | null>(null);
+  const [previewUnavailable, setPreviewUnavailable] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let timer: number | undefined;
+    setMetadata(null);
+    setPreviewUnavailable(false);
+    const loadPreview = () => {
+      setPreviewLoading(true);
+      timer = window.setTimeout(() => {
+        void fetchLinkPreview(preview.url)
+          .then(
+            (result) => {
+              if (active) setMetadata(result);
+            },
+            () => {
+              if (active) setPreviewUnavailable(true);
+            },
+          )
+          .finally(() => {
+            if (active) setPreviewLoading(false);
+          });
+      }, 500);
+    };
+
+    const element = cardRef.current;
+    if (element && "IntersectionObserver" in window) {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) {
+            observer.disconnect();
+            loadPreview();
+          }
+        },
+        { rootMargin: "200px" },
+      );
+      observer.observe(element);
+      return () => {
+        active = false;
+        observer.disconnect();
+        if (timer !== undefined) window.clearTimeout(timer);
+      };
+    }
+
+    loadPreview();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [preview.url]);
+
+  const thumbnail =
+    metadata?.thumbnail && /^data:image\/(?:jpeg|png|webp|gif);base64,/i.test(metadata.thumbnail)
+      ? metadata.thumbnail
+      : undefined;
+
   return (
-    <div className={`link-preview-card ${className}`}>
+    <div ref={cardRef} className={`link-preview-card ${className}`}>
+      {thumbnail && <img className="link-preview-thumbnail" src={thumbnail} alt="" loading="lazy" />}
       <div className="link-preview-copy">
-        <strong className="link-preview-title">{preview.hostname}</strong>
+        <strong className="link-preview-title">{metadata?.title || preview.hostname}</strong>
+        {metadata?.description && <span className="link-preview-description">{metadata.description}</span>}
         <a
           className="link-preview-url"
           href={preview.url}
@@ -208,14 +324,16 @@ function LinkPreviewCard({
           {preview.url}
         </a>
         <span className="link-preview-host">{preview.hostname}</span>
+        {previewLoading && <span className="link-preview-status">Loading preview…</span>}
+        {previewUnavailable && <span className="link-preview-status">Preview details unavailable</span>}
       </div>
       {onDismiss && (
         <button
           type="button"
           className="link-preview-dismiss"
           onClick={onDismiss}
-          aria-label="Dismiss link preview"
-          title="Dismiss preview"
+          aria-label="Dismiss link previews"
+          title="Dismiss previews for this message"
         >
           <X size={17} />
         </button>
@@ -481,9 +599,10 @@ export function ChatsView({
   const [manualInviteUrl, setManualInviteUrl] = useState<string | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [isLookingUp, setIsLookingUp] = useState(false);
-  const currentComposerLink = getLinkPreview(inputText);
-  const composerLinkPreview =
-    currentComposerLink?.url === dismissedComposerLinkUrl ? null : currentComposerLink;
+  const composerLinks = getLinkPreviews(inputText);
+  const composerLinkPreviews = composerLinks.some((link) => link.url === dismissedComposerLinkUrl)
+    ? []
+    : composerLinks;
 
   async function shareMyInviteLink() {
     setManualInviteUrl(null);
@@ -1183,7 +1302,7 @@ export function ChatsView({
         text: replyingTo.text,
       };
     }
-    if (getLinkPreview(messageText)?.url === dismissedComposerLinkUrl) {
+    if (getLinkPreviews(messageText).some((link) => link.url === dismissedComposerLinkUrl)) {
       extra.linkPreviewDisabled = true;
     }
     if (scheduledDateTime) {
@@ -2490,15 +2609,15 @@ export function ChatsView({
                       : null;
 
                     const hasMediaAttachment = !msg.isDeleted && Boolean(msg.attachments?.some((a) => a.type === "image" || a.type === "video"));
-                    const messageLinkPreview =
+                    const messageLinkPreviews =
                       !msg.isDeleted &&
                       !msg.linkPreviewDisabled &&
                       !msg.poll &&
                       !msg.voiceNote &&
                       !msg.sharedContact &&
                       !msg.attachments?.length
-                        ? getLinkPreview(msg.text)
-                        : null;
+                        ? getLinkPreviews(msg.text)
+                        : [];
 
                     return (
                       <Fragment key={msg.id}>
@@ -2918,12 +3037,13 @@ export function ChatsView({
                                   </div>
                                 ))}
 
-                                {messageLinkPreview && (
+                                {messageLinkPreviews.map((preview) => (
                                   <LinkPreviewCard
-                                    preview={messageLinkPreview}
+                                    key={preview.url}
+                                    preview={preview}
                                     className="message-link-preview"
                                   />
-                                )}
+                                ))}
 
                                 {/* Message text / caption content (hide if duplicate of filename or default 'Photo' / 'Document') */}
                                 {msg.text &&
@@ -3176,13 +3296,14 @@ export function ChatsView({
                 ) : (
                   /* Standard WhatsApp Message Input Bar */
                   <>
-                    {composerLinkPreview && (
+                    {composerLinkPreviews.map((preview) => (
                       <LinkPreviewCard
-                        preview={composerLinkPreview}
+                        key={preview.url}
+                        preview={preview}
                         className="composer-link-preview"
-                        onDismiss={() => setDismissedComposerLinkUrl(composerLinkPreview.url)}
+                        onDismiss={() => setDismissedComposerLinkUrl(preview.url)}
                       />
-                    )}
+                    ))}
                   <div className="chat-input-bar">
                     {/* 1. Emoji Picker Trigger */}
                     <button
@@ -3263,7 +3384,7 @@ export function ChatsView({
                     {/* 3. Text Input (Expands horizontally to fill space) */}
                     <div className="chat-input-wrapper">
                       <textarea
-                        className={`chat-text-input ${currentComposerLink && /^https?:\/\/\S+$/i.test(inputText.trim()) ? "is-link" : ""}`}
+                        className={`chat-text-input ${composerLinks[0] && /^https?:\/\/\S+$/i.test(inputText.trim()) ? "is-link" : ""}`}
                         rows={1}
                         placeholder="Type a message..."
                         inputMode="text"
@@ -3271,7 +3392,7 @@ export function ChatsView({
                         value={inputText}
                         onChange={(e) => {
                           const val = e.target.value;
-                          if (getLinkPreview(val)?.url !== currentComposerLink?.url) {
+                          if (!getLinkPreviews(val).some((link) => link.url === dismissedComposerLinkUrl)) {
                             setDismissedComposerLinkUrl(null);
                           }
                           setInputText(val);

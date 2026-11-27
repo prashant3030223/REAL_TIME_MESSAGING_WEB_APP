@@ -13341,6 +13341,15 @@ body.reduced-motion .session-loading-dots span {
   color: #e9edef;
 }
 
+.link-preview-thumbnail {
+  width: 76px;
+  height: 76px;
+  flex: 0 0 76px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  object-fit: cover;
+}
+
 .composer-link-preview {
   box-sizing: border-box;
   width: calc(100% - 32px);
@@ -13370,6 +13379,17 @@ body.reduced-motion .session-loading-dots span {
   white-space: nowrap;
 }
 
+.link-preview-description {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .link-preview-url {
   display: -webkit-box;
   overflow: hidden;
@@ -13394,6 +13414,12 @@ body.reduced-motion .session-loading-dots span {
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.link-preview-status {
+  color: #94a3b8;
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .link-preview-dismiss {
