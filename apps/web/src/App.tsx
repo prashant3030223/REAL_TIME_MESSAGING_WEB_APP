@@ -1545,16 +1545,6 @@ export function App() {
       alert("This conversation has no registered call recipient. Reopen the contact from Contacts and try again.");
       return;
     }
-    const isConnected = conversationsRef.current.some((conversation) =>
-      conversation.type === "direct" &&
-      ((targetUserId && conversation.peerUserId === targetUserId) ||
-        (targetPhone && conversation.peerPhone === targetPhone))
-    );
-    if (!isConnected) {
-      alert("You can call this person after they accept your connection request.");
-      return;
-    }
-
     try {
       await realtime.waitUntilConnected();
     } catch (error) {
