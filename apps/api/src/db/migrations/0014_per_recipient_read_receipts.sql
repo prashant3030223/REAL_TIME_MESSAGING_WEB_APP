@@ -13,6 +13,19 @@ CREATE TABLE IF NOT EXISTS app_message_receipts (
     CHECK (read_at IS NULL OR delivered_at IS NOT NULL)
 );
 
+ALTER TABLE app_message_receipts
+  ADD COLUMN IF NOT EXISTS receipt_state text NOT NULL DEFAULT 'sent'
+    CHECK (receipt_state IN ('sent', 'delivered', 'read', 'unknown'));
+
+UPDATE app_message_receipts
+SET receipt_state = CASE
+  WHEN read_at IS NOT NULL THEN 'read'
+  WHEN delivered_at IS NOT NULL THEN 'delivered'
+  ELSE 'sent'
+END
+WHERE receipt_state = 'sent'
+  AND (read_at IS NOT NULL OR delivered_at IS NOT NULL);
+
 INSERT INTO app_message_receipts (message_id, user_id, receipt_state)
 SELECT message.id,
        member.user_id,
