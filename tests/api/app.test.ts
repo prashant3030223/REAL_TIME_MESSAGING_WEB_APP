@@ -27,6 +27,7 @@ async function withServer(
       conversationId: string;
       deletedBy: string;
       ghostUnsend?: boolean;
+      moderated?: boolean;
     }) => Promise<void>;
     pushDelivery?: { isConfigured: boolean; publicKey: string | null };
     attachmentStorage?: R2AttachmentStorage;
@@ -746,6 +747,204 @@ test("message editing marks sent text as edited and rejects empty edits", async 
     });
     assert.equal(emptyEdit.status, 400);
     assert.equal((await emptyEdit.json() as { error: { code: string } }).error.code, "EMPTY_MESSAGE");
+  });
+});
+
+test("group owners can assign moderators and inspect group audit history", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const ownerId = "00000000-0000-4000-8000-000000000003";
+  const memberId = "00000000-0000-4000-8000-000000000004";
+  const conversationId = "00000000-0000-4000-8000-000000000001";
+  let actorRole = "owner";
+  let assignedRole: string | undefined;
+  let auditEventCount = 0;
+  let auditDetails: Record<string, unknown> | undefined;
+  const client = {
+    query: async (query: string, values: unknown[] = []) => {
+      if (query === "BEGIN" || query === "COMMIT" || query === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+      if (query.includes("SELECT member.role, conversation.type")) {
+        return { rows: [{ role: actorRole, type: "group" }], rowCount: 1 };
+      }
+      if (query.includes("SELECT role FROM app_conversation_members")) {
+        return { rows: [{ role: "member" }], rowCount: 1 };
+      }
+      if (query.includes("UPDATE app_conversation_members member")) {
+        assignedRole = String(values[0]);
+        return { rows: [{ user_id: memberId }], rowCount: 1 };
+      }
+      if (query.includes("INSERT INTO app_group_audit_log")) {
+        auditEventCount += 1;
+        auditDetails = JSON.parse(String(values[3])) as Record<string, unknown>;
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`Unexpected group-role database query: ${query}`);
+    },
+    release: () => {},
+  };
+  const database = {
+    query: async (query: string) => {
+      if (query.includes("FROM app_sessions")) {
+        return { rows: [{ user_id: ownerId }], rowCount: 1 };
+      }
+      if (query.includes("SELECT member.role, conversation.type")) {
+        return { rows: [{ role: actorRole, type: "group" }], rowCount: 1 };
+      }
+      if (query.includes("SELECT audit.id")) {
+        return {
+          rows: [{
+            id: "00000000-0000-4000-8000-000000000005",
+            action: "member_role_changed",
+            details: { previousRole: "member", newRole: "moderator" },
+            actor_name: "Owner",
+            target_name: "Moderator",
+            created_at: "2026-01-01T00:00:00.000Z",
+          }],
+          rowCount: 1,
+        };
+      }
+      throw new Error(`Unexpected group-audit database query: ${query}`);
+    },
+    connect: async () => client,
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const headers = {
+      "content-type": "application/json",
+      cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+    };
+    const roleResponse = await fetch(
+      `${baseUrl}/api/conversations/${conversationId}/members/${memberId}`,
+      { method: "PATCH", headers, body: JSON.stringify({ role: "moderator" }) },
+    );
+    assert.equal(roleResponse.status, 200);
+    assert.equal(assignedRole, "moderator");
+    assert.equal(auditEventCount, 1);
+    assert.deepEqual(auditDetails, { previousRole: "member", newRole: "moderator" });
+
+    const auditResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/audit`, { headers });
+    assert.equal(auditResponse.status, 200);
+    assert.equal((await auditResponse.json() as { events: Array<{ action: string }> }).events[0]?.action, "member_role_changed");
+
+    actorRole = "admin";
+    const adminPromotionResponse = await fetch(
+      `${baseUrl}/api/conversations/${conversationId}/members/${memberId}`,
+      { method: "PATCH", headers, body: JSON.stringify({ role: "admin" }) },
+    );
+    assert.equal(adminPromotionResponse.status, 403);
+    assert.equal(auditEventCount, 1);
+
+    actorRole = "member";
+    const forbiddenRoleResponse = await fetch(
+      `${baseUrl}/api/conversations/${conversationId}/members/${memberId}`,
+      { method: "PATCH", headers, body: JSON.stringify({ role: "admin" }) },
+    );
+    assert.equal(forbiddenRoleResponse.status, 403);
+    assert.equal(auditEventCount, 1);
+    const forbiddenAuditResponse = await fetch(`${baseUrl}/api/conversations/${conversationId}/audit`, { headers });
+    assert.equal(forbiddenAuditResponse.status, 403);
+  });
+});
+
+test("group moderators can remove another member's message and the action is audited", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const moderatorId = "00000000-0000-4000-8000-000000000003";
+  const senderId = "00000000-0000-4000-8000-000000000004";
+  const conversationId = "00000000-0000-4000-8000-000000000001";
+  const messageId = "00000000-0000-4000-8000-000000000002";
+  let actorRole = "moderator";
+  let auditEventCount = 0;
+  let deletedMessage = false;
+  const deletionNotices: Array<{ moderated?: boolean }> = [];
+  const client = {
+    query: async (query: string, values: unknown[] = []) => {
+      if (query === "BEGIN" || query === "COMMIT" || query === "ROLLBACK") {
+        return { rows: [], rowCount: 0 };
+      }
+      if (query.includes("SELECT member.role, conversation.type")) {
+        return { rows: [{ role: actorRole, type: "group" }], rowCount: 1 };
+      }
+      if (query.includes("SELECT sender_id, attachments, metadata") && query.includes("FOR UPDATE")) {
+        return { rows: [{ sender_id: senderId, attachments: [], metadata: {} }], rowCount: 1 };
+      }
+      if (query.includes("UPDATE app_messages") && query.includes("moderatedByUserId")) {
+        deletedMessage = true;
+        assert.equal(values[0], messageId);
+        assert.equal(values[1], conversationId);
+        assert.equal(values[2], moderatorId);
+        return { rows: [], rowCount: 1 };
+      }
+      if (query.includes("INSERT INTO app_group_audit_log")) {
+        auditEventCount += 1;
+        assert.equal(values[2], senderId);
+        assert.equal(values[3], messageId);
+        assert.deepEqual(JSON.parse(String(values[4])), { moderatorRole: "moderator" });
+        return { rows: [], rowCount: 1 };
+      }
+      throw new Error(`Unexpected moderation database query: ${query}`);
+    },
+    release: () => {},
+  };
+  const database = {
+    query: async (query: string) => {
+      if (query.includes("FROM app_sessions")) {
+        return { rows: [{ user_id: moderatorId }], rowCount: 1 };
+      }
+      if (query.includes("SELECT 1 FROM app_conversation_members own")) {
+        return { rows: [{}], rowCount: 1 };
+      }
+      if (query.includes("SELECT sender_id, text, attachments FROM app_messages")) {
+        return {
+          rows: [{ sender_id: senderId, text: "Inappropriate message", attachments: [] }],
+          rowCount: 1,
+        };
+      }
+      throw new Error(`Unexpected moderation pool query: ${query}`);
+    },
+    connect: async () => client,
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const endpoint = `${baseUrl}/api/conversations/${conversationId}/messages/${messageId}`;
+    const headers = {
+      "content-type": "application/json",
+      cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+    };
+    const response = await fetch(endpoint, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        text: "🚫 This message was removed by a group moderator",
+        metadata: { isDeleted: true },
+        attachments: null,
+        voiceNote: null,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { updated: true, moderated: true });
+    assert.equal(deletedMessage, true);
+    assert.equal(auditEventCount, 1);
+    assert.equal(deletionNotices[0]?.moderated, true);
+
+    actorRole = "member";
+    const forbiddenResponse = await fetch(endpoint, {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({
+        text: "🚫 This message was removed by a group moderator",
+        metadata: { isDeleted: true },
+        attachments: null,
+        voiceNote: null,
+      }),
+    });
+    assert.equal(forbiddenResponse.status, 403);
+    assert.equal(deletedMessage, true);
+    assert.equal(auditEventCount, 1);
+  }, {
+    notifyMessageDeleted: async (payload) => {
+      deletionNotices.push(payload);
+    },
   });
 });
 

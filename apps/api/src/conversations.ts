@@ -37,7 +37,7 @@ const UpdateGroupSchema = z.object({
   avatar: z.string().max(2048).optional(),
 }).refine((value) => value.name !== undefined || value.description !== undefined || value.avatar !== undefined);
 const UpdateMemberRoleSchema = z.object({
-  role: z.enum(["admin", "member"]),
+  role: z.enum(["admin", "moderator", "member"]),
 });
 const UpdateConversationLockSchema = z.object({
   isLocked: z.boolean(),
@@ -259,6 +259,7 @@ export function createConversationsRouter(
     conversationId: string;
     deletedBy: string;
     ghostUnsend?: boolean;
+    moderated?: boolean;
   }) => Promise<void>,
   notifyPushToUser?: (userId: string, payload: PushNotificationPayload) => Promise<void>,
 ) {
@@ -460,6 +461,7 @@ export function createConversationsRouter(
     conversationId: string;
     deletedBy: string;
     ghostUnsend?: boolean;
+    moderated?: boolean;
   }): Promise<void> {
     if (!notifyMessageDeleted) return;
     try {
@@ -639,13 +641,13 @@ export function createConversationsRouter(
       const result = await database.query<{
         id: string;
         type: string;
-        current_user_role: "owner" | "admin" | "member";
+        current_user_role: "owner" | "admin" | "moderator" | "member";
         is_locked: boolean;
         members: Array<{
           id: string;
           name: string;
           avatar: string;
-          role: "owner" | "admin" | "member";
+          role: "owner" | "admin" | "moderator" | "member";
         }> | null;
         name: string | null;
         description: string | null;
@@ -816,7 +818,7 @@ export function createConversationsRouter(
               peer_avatar: string | null;
               peer_phone: string | null;
               is_locked: boolean;
-              current_user_role: "owner" | "admin" | "member";
+              current_user_role: "owner" | "admin" | "moderator" | "member";
             }>(
               `SELECT c.id, c.name, c.description, c.avatar,
                       peer.display_name AS peer_name, peer.avatar AS peer_avatar,
@@ -885,7 +887,7 @@ export function createConversationsRouter(
               id: string;
               name: string;
               avatar: string;
-              role: "owner" | "admin" | "member";
+              role: "owner" | "admin" | "moderator" | "member";
             }>(
               `SELECT member.user_id AS id, user_profile.display_name AS name,
                       COALESCE(user_profile.avatar, '') AS avatar, member.role
@@ -1120,14 +1122,49 @@ export function createConversationsRouter(
       next(new ApiError(503, "DATABASE_UNAVAILABLE", "Group management requires the database."));
       return;
     }
+    let client: PoolClient | undefined;
+    let transactionStarted = false;
     try {
       const userId = await getUserId(request);
-      const role = await requireGroupAdmin(conversationId, userId);
-      if (role !== "owner") {
-        next(new ApiError(403, "OWNER_REQUIRED", "Only the group owner can change admin roles."));
+      client = await database.connect();
+      await client.query("BEGIN");
+      transactionStarted = true;
+      const actor = await client.query<{ role: string; type: string }>(
+        `SELECT member.role, conversation.type
+         FROM app_conversation_members member
+         JOIN app_conversations conversation ON conversation.id = member.conversation_id
+         WHERE member.conversation_id = $1 AND member.user_id = $2
+         FOR UPDATE`,
+        [conversationId, userId],
+      );
+      if (!actor.rows[0] || actor.rows[0].type !== "group") {
+        throw new ApiError(404, "GROUP_NOT_FOUND", "Group not found.");
+      }
+      if (actor.rows[0].role !== "owner" && actor.rows[0].role !== "admin") {
+        throw new ApiError(403, "GROUP_ADMIN_REQUIRED", "Only group admins can change member roles.");
+      }
+      const target = await client.query<{ role: string }>(
+        `SELECT role FROM app_conversation_members
+         WHERE conversation_id = $1 AND user_id = $2
+         FOR UPDATE`,
+        [conversationId, memberId],
+      );
+      if (!target.rows[0] || target.rows[0].role === "owner") {
+        throw new ApiError(404, "GROUP_MEMBER_NOT_FOUND", "Group member not found or cannot be changed.");
+      }
+      if (actor.rows[0].role === "admin" && target.rows[0].role === "admin") {
+        throw new ApiError(403, "ADMIN_CANNOT_CHANGE_ADMIN", "Admins cannot change another admin's role.");
+      }
+      if (actor.rows[0].role === "admin" && parsed.data.role === "admin") {
+        throw new ApiError(403, "OWNER_REQUIRED_TO_ASSIGN_ADMIN", "Only the group owner can assign admin roles.");
+      }
+      if (target.rows[0].role === parsed.data.role) {
+        await client.query("COMMIT");
+        transactionStarted = false;
+        response.status(200).json({ updated: true });
         return;
       }
-      const result = await database.query(
+      await client.query(
         `UPDATE app_conversation_members member
          SET role = $1
          FROM app_conversations conversation
@@ -1137,11 +1174,58 @@ export function createConversationsRouter(
          RETURNING member.user_id`,
         [parsed.data.role, conversationId, memberId],
       );
-      if (result.rowCount === 0) {
-        next(new ApiError(404, "GROUP_MEMBER_NOT_FOUND", "Group member not found or cannot be changed."));
-        return;
-      }
+      await client.query(
+        `INSERT INTO app_group_audit_log
+         (conversation_id, actor_id, target_user_id, action, details)
+         VALUES ($1, $2, $3, 'member_role_changed', $4::jsonb)`,
+        [
+          conversationId,
+          userId,
+          memberId,
+          JSON.stringify({ previousRole: target.rows[0].role, newRole: parsed.data.role }),
+        ],
+      );
+      await client.query("COMMIT");
+      transactionStarted = false;
       response.status(200).json({ updated: true });
+    } catch (error) {
+      if (client && transactionStarted) await client.query("ROLLBACK");
+      next(error);
+    } finally {
+      client?.release();
+    }
+  });
+
+  router.get("/:id/audit", async (request, response, next) => {
+    const conversationId = request.params["id"] ?? "";
+    if (!database) {
+      next(new ApiError(503, "DATABASE_UNAVAILABLE", "Group audit history requires the database."));
+      return;
+    }
+    try {
+      const userId = await getUserId(request);
+      await requireGroupAdmin(conversationId, userId);
+      const result = await database.query<{
+        id: string;
+        action: string;
+        details: Record<string, unknown>;
+        actor_name: string;
+        target_name: string | null;
+        created_at: Date | string;
+      }>(
+        `SELECT audit.id, audit.action, audit.details,
+                actor.display_name AS actor_name,
+                target.display_name AS target_name,
+                audit.created_at
+         FROM app_group_audit_log audit
+         JOIN app_users actor ON actor.id = audit.actor_id
+         LEFT JOIN app_users target ON target.id = audit.target_user_id
+         WHERE audit.conversation_id = $1
+         ORDER BY audit.created_at DESC
+         LIMIT 100`,
+        [conversationId],
+      );
+      response.status(200).json({ events: result.rows });
     } catch (error) {
       next(error);
     }
@@ -1178,11 +1262,13 @@ export function createConversationsRouter(
         throw new ApiError(404, "GROUP_NOT_FOUND", "Group not found.");
       }
       const isLeaving = memberId === userId;
-      if (!isLeaving && actor.role !== "owner" && actor.role !== "admin") {
-        throw new ApiError(403, "GROUP_ADMIN_REQUIRED", "Only group admins can remove members.");
+      if (!isLeaving && actor.role !== "owner" && actor.role !== "admin" && actor.role !== "moderator") {
+        throw new ApiError(403, "GROUP_ADMIN_REQUIRED", "Only group moderators can remove members.");
       }
       const target = await client.query<{ role: string }>(
-        "SELECT role FROM app_conversation_members WHERE conversation_id = $1 AND user_id = $2",
+        `SELECT role FROM app_conversation_members
+         WHERE conversation_id = $1 AND user_id = $2
+         FOR UPDATE`,
         [conversationId, memberId],
       );
       if (!target.rows[0]) {
@@ -1191,9 +1277,24 @@ export function createConversationsRouter(
       if (target.rows[0].role === "owner" && !isLeaving) {
         throw new ApiError(403, "OWNER_CANNOT_BE_REMOVED", "The group owner cannot be removed.");
       }
-      if (!isLeaving && actor.role === "admin" && target.rows[0].role === "admin") {
-        throw new ApiError(403, "ADMIN_CANNOT_REMOVE_ADMIN", "Admins cannot remove another admin.");
+      if (!isLeaving && actor.role === "moderator" && target.rows[0].role !== "member") {
+        throw new ApiError(403, "MODERATOR_CANNOT_REMOVE_PRIVILEGED_MEMBER", "Moderators can only remove regular members.");
       }
+      if (!isLeaving && actor.role === "admin" && (target.rows[0].role === "admin" || target.rows[0].role === "moderator")) {
+        throw new ApiError(403, "ADMIN_CANNOT_REMOVE_PRIVILEGED_MEMBER", "Admins cannot remove another admin or moderator.");
+      }
+      await client.query(
+        `INSERT INTO app_group_audit_log
+         (conversation_id, actor_id, target_user_id, action, details)
+         VALUES ($1, $2, $3, $4, $5::jsonb)`,
+        [
+          conversationId,
+          userId,
+          memberId,
+          isLeaving ? "member_left" : "member_removed",
+          JSON.stringify({ targetRole: target.rows[0].role }),
+        ],
+      );
       await client.query(
         "DELETE FROM app_conversation_members WHERE conversation_id = $1 AND user_id = $2",
         [conversationId, memberId],
@@ -1202,15 +1303,21 @@ export function createConversationsRouter(
         const nextOwner = await client.query<{ user_id: string }>(
           `SELECT user_id FROM app_conversation_members
            WHERE conversation_id = $1
-           ORDER BY CASE role WHEN 'admin' THEN 0 ELSE 1 END, joined_at
+            ORDER BY CASE role WHEN 'admin' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END, joined_at
            LIMIT 1`,
           [conversationId],
         );
         const ownerId = nextOwner.rows[0]?.user_id;
         if (ownerId) {
           await client.query(
-    "UPDATE app_conversation_members SET role = 'owner' WHERE conversation_id = $1 AND user_id = $2",
-    [conversationId, ownerId],
+            "UPDATE app_conversation_members SET role = 'owner' WHERE conversation_id = $1 AND user_id = $2",
+            [conversationId, ownerId],
+          );
+          await client.query(
+            `INSERT INTO app_group_audit_log
+             (conversation_id, actor_id, target_user_id, action, details)
+             VALUES ($1, $2, $3, 'owner_transferred', $4::jsonb)`,
+            [conversationId, userId, ownerId, JSON.stringify({ previousOwnerId: userId })],
           );
         } else {
           await client.query("DELETE FROM app_conversations WHERE id = $1", [conversationId]);
@@ -1940,6 +2047,90 @@ export function createConversationsRouter(
       const message = existing.rows[0];
       if (!message) {
         next(new ApiError(404, "MESSAGE_NOT_FOUND", "Message not found."));
+        return;
+      }
+
+      if (message.sender_id !== userId && parsed.data.metadata?.isDeleted === true) {
+        let client: PoolClient | undefined;
+        let transactionStarted = false;
+        let actorRole: string | undefined;
+        try {
+          client = await database.connect();
+          await client.query("BEGIN");
+          transactionStarted = true;
+          const actor = await client.query<{ role: string; type: string }>(
+            `SELECT member.role, conversation.type
+             FROM app_conversation_members member
+             JOIN app_conversations conversation ON conversation.id = member.conversation_id
+             WHERE member.conversation_id = $1 AND member.user_id = $2
+             FOR UPDATE`,
+            [conversationId, userId],
+          );
+          actorRole = actor.rows[0]?.role;
+          if (
+            actor.rows[0]?.type !== "group" ||
+            (actorRole !== "owner" && actorRole !== "admin" && actorRole !== "moderator")
+          ) {
+            throw new ApiError(403, "MESSAGE_MODERATION_FORBIDDEN", "Only group moderators can remove another member's message.");
+          }
+          const locked = await client.query<{
+            sender_id: string;
+            attachments: unknown[] | null;
+            metadata: Record<string, unknown> | null;
+          }>(
+            `SELECT sender_id, attachments, metadata
+             FROM app_messages
+             WHERE id = $1 AND conversation_id = $2
+             FOR UPDATE`,
+            [messageId, conversationId],
+          );
+          const lockedMessage = locked.rows[0];
+          if (!lockedMessage) {
+            throw new ApiError(404, "MESSAGE_NOT_FOUND", "Message not found.");
+          }
+          if (lockedMessage.metadata?.["isDeleted"] === true) {
+            await client.query("COMMIT");
+            transactionStarted = false;
+            response.status(200).json({ updated: true, moderated: true });
+            return;
+          }
+
+          await client.query(
+            `INSERT INTO app_group_audit_log
+             (conversation_id, actor_id, target_user_id, target_message_id, action, details)
+             VALUES ($1, $2, $3, $4, 'message_moderated', $5::jsonb)`,
+            [
+              conversationId,
+              userId,
+              lockedMessage.sender_id,
+              messageId,
+              JSON.stringify({ moderatorRole: actorRole }),
+            ],
+          );
+          await removeR2Attachments(conversationId, lockedMessage.attachments);
+          await client.query(
+            `UPDATE app_messages
+             SET text = '🚫 This message was removed by a group moderator',
+                 metadata = jsonb_build_object(
+                   'isDeleted', true,
+                   'moderatedByUserId', $3::text
+                 ),
+                 attachments = NULL,
+                 voice_note = NULL
+             WHERE id = $1 AND conversation_id = $2`,
+            [messageId, conversationId, userId],
+          );
+          await client.query("COMMIT");
+          transactionStarted = false;
+        } catch (error) {
+          if (client && transactionStarted) await client.query("ROLLBACK");
+          throw error;
+        } finally {
+          client?.release();
+        }
+
+        await notifyDeletedMessage({ messageId, conversationId, deletedBy: userId, moderated: true });
+        response.status(200).json({ updated: true, moderated: true });
         return;
       }
 

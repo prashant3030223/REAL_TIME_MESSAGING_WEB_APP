@@ -371,6 +371,7 @@ export function createRealtimeGateway(
     conversationId: string;
     deletedBy: string;
     ghostUnsend?: boolean;
+    moderated?: boolean;
   }) {
     await broadcastToConversation(
       {

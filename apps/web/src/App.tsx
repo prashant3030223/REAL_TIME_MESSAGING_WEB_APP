@@ -833,7 +833,7 @@ export function App() {
     });
 
     // Realtime message deleted
-    const unsubDelete = realtime.subscribe("chat:delete", (data: { messageId: string; conversationId: string; deletedForEveryone?: boolean; deletedBy?: string; ghostUnsend?: boolean }) => {
+    const unsubDelete = realtime.subscribe("chat:delete", (data: { messageId: string; conversationId: string; deletedForEveryone?: boolean; deletedBy?: string; ghostUnsend?: boolean; moderated?: boolean }) => {
       if (!data?.messageId || !data?.conversationId) return;
       if (data.ghostUnsend) {
         setMessages((prev) => {
@@ -871,7 +871,9 @@ export function App() {
               ? {
                   ...m,
                   isDeleted: true,
-                  text: "🚫 This message was deleted",
+                  text: data.moderated
+                    ? "🚫 This message was removed by a group moderator"
+                    : "🚫 This message was deleted",
                   attachments: undefined,
                   voiceNote: undefined,
                   poll: undefined,

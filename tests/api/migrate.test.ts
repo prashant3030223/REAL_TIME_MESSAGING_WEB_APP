@@ -64,6 +64,8 @@ test("API startup migrations add per-member conversation lock settings", async (
   assert.equal(released, true);
   assert.ok(appliedMigrations.has("0007_conversation_lock.sql"));
   assert.equal(appliedMigrations.has("0003_phone_auth.sql"), false);
-  assert.equal(migrationSql.length, 1);
-  assert.match(migrationSql[0] ?? "", /ADD COLUMN IF NOT EXISTS is_locked boolean NOT NULL DEFAULT false/);
+  const lockMigrations = migrationSql.filter((query) =>
+    query.includes("ADD COLUMN IF NOT EXISTS is_locked boolean NOT NULL DEFAULT false"),
+  );
+  assert.equal(lockMigrations.length, 1);
 });

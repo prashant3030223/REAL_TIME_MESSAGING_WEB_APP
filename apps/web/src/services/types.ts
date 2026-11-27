@@ -98,7 +98,7 @@ export type ConversationMember = {
   id: string;
   name: string;
   avatar: string;
-  role: "owner" | "admin" | "member";
+  role: "owner" | "admin" | "moderator" | "member";
   isOnline?: boolean;
 };
 

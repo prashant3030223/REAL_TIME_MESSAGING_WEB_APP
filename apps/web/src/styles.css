@@ -5927,6 +5927,33 @@ body.reduced-motion *::after {
   font-size: 11px;
 }
 
+.group-role-badge.role-moderator {
+  color: #38bdf8;
+}
+
+.group-audit-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.group-audit-event {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+
+.group-audit-event time {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 .group-member-row select {
   flex: 0 0 auto;
   max-width: 82px;

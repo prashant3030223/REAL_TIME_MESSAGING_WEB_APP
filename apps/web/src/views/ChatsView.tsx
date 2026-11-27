@@ -121,6 +121,33 @@ type PollOptionDraft = {
   text: string;
 };
 
+type GroupAuditEvent = {
+  id: string;
+  action: string;
+  details: Record<string, unknown>;
+  actor_name: string;
+  target_name: string | null;
+  created_at: string;
+};
+
+function describeGroupAuditEvent(event: GroupAuditEvent): string {
+  const target = event.target_name ?? "a member";
+  if (event.action === "member_role_changed") {
+    const previousRole = typeof event.details["previousRole"] === "string"
+      ? event.details["previousRole"]
+      : "member";
+    const newRole = typeof event.details["newRole"] === "string"
+      ? event.details["newRole"]
+      : "member";
+    return `Changed ${target}'s role from ${previousRole} to ${newRole}`;
+  }
+  if (event.action === "member_removed") return `Removed ${target} from the group`;
+  if (event.action === "member_left") return `${event.actor_name} left the group`;
+  if (event.action === "owner_transferred") return `Transferred ownership to ${target}`;
+  if (event.action === "message_moderated") return `Removed a message from ${target}`;
+  return "Updated group activity";
+}
+
 type DeviceContact = {
   name?: string[];
   tel?: string[];
@@ -538,6 +565,9 @@ export function ChatsView({
   const [selectedGroupMemberIds, setSelectedGroupMemberIds] = useState<string[]>([]);
   const [groupManageError, setGroupManageError] = useState<string | null>(null);
   const [groupActionPending, setGroupActionPending] = useState(false);
+  const [groupAuditEvents, setGroupAuditEvents] = useState<GroupAuditEvent[]>([]);
+  const [groupAuditOpen, setGroupAuditOpen] = useState(false);
+  const [groupAuditLoading, setGroupAuditLoading] = useState(false);
   const [showAddGroupMembers, setShowAddGroupMembers] = useState(false);
   const [selectedNewMemberIds, setSelectedNewMemberIds] = useState<string[]>([]);
   const [groupNameDraft, setGroupNameDraft] = useState("");
@@ -826,6 +856,9 @@ export function ChatsView({
     setGroupManageError(null);
     setShowAddGroupMembers(false);
     setSelectedNewMemberIds([]);
+    setGroupAuditEvents([]);
+    setGroupAuditOpen(false);
+    setGroupAuditLoading(false);
   }, [activeConv?.id, activeConv?.name, activeConv?.description]);
 
   useEffect(() => {
@@ -1277,6 +1310,34 @@ export function ChatsView({
       return false;
     } finally {
       setGroupActionPending(false);
+    }
+  }
+
+  async function handleToggleGroupAudit() {
+    if (!activeConv) return;
+    if (groupAuditOpen) {
+      setGroupAuditOpen(false);
+      return;
+    }
+
+    setGroupAuditLoading(true);
+    setGroupManageError(null);
+    const conversationId = activeConv.id;
+    try {
+      const response = await fetch(
+        `/api/conversations/${encodeURIComponent(conversationId)}/audit`,
+      );
+      const result = await response.json() as { events?: GroupAuditEvent[]; error?: { message?: string } };
+      if (draftConversationIdRef.current !== conversationId) return;
+      if (!response.ok) throw new Error(result.error?.message || "Could not load group activity.");
+      setGroupAuditEvents(result.events ?? []);
+      setGroupAuditOpen(true);
+    } catch (error) {
+      if (draftConversationIdRef.current === conversationId) {
+        setGroupManageError(error instanceof Error ? error.message : "Could not load group activity.");
+      }
+    } finally {
+      if (draftConversationIdRef.current === conversationId) setGroupAuditLoading(false);
     }
   }
 
@@ -1803,7 +1864,7 @@ export function ChatsView({
     }
   }
 
-  async function persistMessageUpdate(message: Message) {
+  async function persistMessageUpdate(message: Message): Promise<boolean> {
     const {
       id,
       conversationId,
@@ -1835,8 +1896,10 @@ export function ChatsView({
         const result = await response.json() as { error?: { message?: string } };
         throw new Error(result.error?.message || "Could not save message changes.");
       }
+      return true;
     } catch (error) {
       setCopiedToast(error instanceof Error ? error.message : "Could not save message changes.");
+      return false;
     }
   }
 
@@ -1939,23 +2002,40 @@ export function ChatsView({
         setTimeout(() => setCopiedToast(null), 2500);
       } else {
         // 2. Standard delete with trace
+        const isModeratingAnotherMember = msg.senderId !== currentUser.id;
         const updatedMessage: Message = {
           ...msg,
           isDeleted: true,
-          text: "🚫 You deleted this message",
+          text: isModeratingAnotherMember
+            ? "🚫 This message was removed by a group moderator"
+            : "🚫 You deleted this message",
           attachments: undefined,
           voiceNote: undefined,
           poll: undefined,
         };
-        onUpdateMessages?.((prev) => {
-          const list = prev[activeConv.id];
-          if (!list) return prev;
-          return {
-            ...prev,
-            [activeConv.id]: list.map((m) => m.id === msg.id ? updatedMessage : m),
-          };
-        });
-        void persistMessageUpdate(updatedMessage);
+        if (isModeratingAnotherMember) {
+          void persistMessageUpdate(updatedMessage).then((saved) => {
+            if (!saved) return;
+            onUpdateMessages?.((prev) => {
+              const list = prev[activeConv.id];
+              if (!list) return prev;
+              return {
+                ...prev,
+                [activeConv.id]: list.map((m) => m.id === msg.id ? updatedMessage : m),
+              };
+            });
+          });
+        } else {
+          onUpdateMessages?.((prev) => {
+            const list = prev[activeConv.id];
+            if (!list) return prev;
+            return {
+              ...prev,
+              [activeConv.id]: list.map((m) => m.id === msg.id ? updatedMessage : m),
+            };
+          });
+          void persistMessageUpdate(updatedMessage);
+        }
 
       }
     } else {
@@ -3912,7 +3992,9 @@ export function ChatsView({
                               {!(activeConv.currentUserRole === "owner" && member.role !== "owner") && (
                                 <span className={`group-role-badge role-${member.role}`}>{member.role}</span>
                               )}
-                              {activeConv.currentUserRole === "owner" && member.role !== "owner" && (
+                              {((activeConv.currentUserRole === "owner" && member.role !== "owner") ||
+                                (activeConv.currentUserRole === "admin" &&
+                                  member.role !== "owner" && member.role !== "admin")) && (
                                 <select
                                   aria-label={`Role for ${member.name}`}
                                   value={member.role}
@@ -3924,11 +4006,15 @@ export function ChatsView({
                                   )}
                                 >
                                   <option value="member">Member</option>
+                                  <option value="moderator">Moderator</option>
+                                {activeConv.currentUserRole === "owner" && (
                                   <option value="admin">Admin</option>
+                                )}
                                 </select>
                               )}
                               {(activeConv.currentUserRole === "owner" && member.role !== "owner") ||
-                                (activeConv.currentUserRole === "admin" && member.role === "member") ? (
+                                ((activeConv.currentUserRole === "admin" || activeConv.currentUserRole === "moderator") &&
+                                  member.role === "member") ? (
                                 <button
                                   type="button"
                                   className="group-remove-member-btn"
@@ -3943,6 +4029,39 @@ export function ChatsView({
                           ))}
                         </div>
                       </div>
+                      {(activeConv.currentUserRole === "owner" || activeConv.currentUserRole === "admin") && (
+                        <div className="wa-drawer-section group-audit-section">
+                          <button
+                            type="button"
+                            className="wa-drawer-action-btn"
+                            disabled={groupAuditLoading}
+                            onClick={() => void handleToggleGroupAudit()}
+                          >
+                            <Info size={15} />
+                            <span>
+                              {groupAuditLoading
+                                ? "Loading group activity..."
+                                : groupAuditOpen
+                                  ? "Hide group activity"
+                                  : "Recent group activity"}
+                            </span>
+                          </button>
+                          {groupAuditOpen && (
+                            <div className="group-audit-list" aria-live="polite">
+                              {groupAuditEvents.length === 0 ? (
+                                <span>No group activity recorded yet.</span>
+                              ) : groupAuditEvents.map((event) => (
+                                <div className="group-audit-event" key={event.id}>
+                                  <span>{describeGroupAuditEvent(event)}</span>
+                                  <time dateTime={event.created_at}>
+                                    {new Date(event.created_at).toLocaleString()}
+                                  </time>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {groupManageError && <p className="group-manage-error" role="alert">{groupManageError}</p>}
                       <div className="wa-drawer-section">
                         <button
@@ -4231,6 +4350,24 @@ export function ChatsView({
                         </button>
                       </>
                     )}
+                    {deleteConfirmMsg.senderId !== currentUser.id &&
+                      activeConv?.type === "group" &&
+                      ["owner", "admin", "moderator"].includes(activeConv.currentUserRole ?? "") && (
+                        <button
+                          type="button"
+                          className="secondary-btn"
+                          style={{ borderColor: "rgba(239, 68, 68, 0.35)", color: "#f87171", display: "flex", alignItems: "center", gap: 10, padding: "10px 14px" }}
+                          onClick={() => handleDeleteMessage(deleteConfirmMsg, true, false)}
+                        >
+                          <Trash2 size={16} />
+                          <div style={{ textAlign: "left" }}>
+                            <div style={{ fontWeight: 600, fontSize: 13.5 }}>Remove for everyone</div>
+                            <div style={{ fontSize: 11, opacity: 0.75, color: "#cbd5e1" }}>
+                              Group moderators can remove inappropriate messages
+                            </div>
+                          </div>
+                        </button>
+                      )}
                     <button
                       type="button"
                       className="secondary-btn"

@@ -29,6 +29,7 @@ export type AppDependencies = {
     conversationId: string;
     deletedBy: string;
     ghostUnsend?: boolean;
+    moderated?: boolean;
   }) => Promise<void>;
   notifyPushToUser?: (userId: string, payload: PushNotificationPayload) => Promise<void>;
   pushDelivery?: { isConfigured: boolean; publicKey: string | null };
