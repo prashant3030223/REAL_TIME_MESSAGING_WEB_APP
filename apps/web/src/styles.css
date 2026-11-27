@@ -11923,6 +11923,90 @@ body.reduced-motion .session-loading-dots span {
   color: #fca5a5;
 }
 
+.message-info-receipts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.message-info-receipts h4 {
+  margin: 0;
+  color: #e9edef;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.message-info-receipts ul {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.message-info-receipts li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.message-info-receipts li img {
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.message-info-recipient-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: #e9edef;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-info-recipient-status {
+  color: #b6c4ce;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.message-info-recipient-status.is-read {
+  color: #38bdf8;
+}
+
+.message-info-recipient-status.is-delivered {
+  color: #34d399;
+}
+
+.message-info-receipts li time,
+.message-info-receipts-note {
+  color: #8696a0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.message-info-receipts li time {
+  flex: 0 0 auto;
+}
+
+.message-info-receipts-note {
+  margin: 0;
+}
+
+.message-info-receipts-note.is-error {
+  color: #fca5a5;
+}
+
 .message-info-footer {
   display: flex;
   align-items: flex-start;

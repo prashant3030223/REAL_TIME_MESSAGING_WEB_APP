@@ -255,10 +255,20 @@ export function createRealtimeGateway(
     conversationId: string,
     senderId: string,
     senderClientId: string,
-  ): Promise<{ isMember: boolean; recipientDeliveredCount: number; hasBotMember: boolean }> {
+  ): Promise<{
+    isMember: boolean;
+    recipientDeliveredCount: number;
+    deliveredUserIds: string[];
+    hasBotMember: boolean;
+  }> {
     if (!database) {
       broadcast(message, senderClientId);
-      return { isMember: true, recipientDeliveredCount: clients.size > 1 ? 1 : 0, hasBotMember: false };
+      return {
+        isMember: true,
+        recipientDeliveredCount: clients.size > 1 ? 1 : 0,
+        deliveredUserIds: [],
+        hasBotMember: false,
+      };
     }
 
     const membership = await database.query<{ user_id: string; type: string }>(
@@ -269,18 +279,19 @@ export function createRealtimeGateway(
       [conversationId],
     );
     if (!membership.rows.some((member) => member.user_id === senderId)) {
-      return { isMember: false, recipientDeliveredCount: 0, hasBotMember: false };
+      return { isMember: false, recipientDeliveredCount: 0, deliveredUserIds: [], hasBotMember: false };
     }
     if (membership.rows[0]?.type === "direct") {
       const peerId = membership.rows.find((member) => member.user_id !== senderId)?.user_id;
       if (!peerId || !(await areUsersConnected(database, senderId, peerId))) {
-        return { isMember: false, recipientDeliveredCount: 0, hasBotMember: false };
+        return { isMember: false, recipientDeliveredCount: 0, deliveredUserIds: [], hasBotMember: false };
       }
     }
     const memberIds = new Set(membership.rows.map((member) => member.user_id));
 
     const raw = JSON.stringify(message);
     let recipientDeliveredCount = 0;
+    const deliveredUserIds = new Set<string>();
     for (const [clientId, client] of clients.entries()) {
       if (
         clientId !== senderClientId &&
@@ -289,10 +300,11 @@ export function createRealtimeGateway(
         client.ws.readyState === WebSocket.OPEN
       ) {
         recipientDeliveredCount++;
+        deliveredUserIds.add(client.userId);
         client.ws.send(raw);
       }
     }
-    return { isMember: true, recipientDeliveredCount, hasBotMember: false };
+    return { isMember: true, recipientDeliveredCount, deliveredUserIds: [...deliveredUserIds], hasBotMember: false };
   }
 
   async function broadcastReadReceipt(
@@ -500,7 +512,7 @@ export function createRealtimeGateway(
               const messageId = msg.payload?.id;
               if (!conversationId || !client.userId || typeof messageId !== "string" || !/^[0-9a-f-]{36}$/i.test(messageId)) break;
               msg.payload = { ...msg.payload, senderId: client.userId };
-              const { isMember, recipientDeliveredCount, hasBotMember } = await broadcastToConversation(
+              const { isMember, recipientDeliveredCount, deliveredUserIds, hasBotMember } = await broadcastToConversation(
                 msg,
                 conversationId,
                 client.userId,
@@ -512,6 +524,21 @@ export function createRealtimeGateway(
                   payload: { conversationId, messageId: msg.payload?.id, code: "CONVERSATION_NOT_FOUND" },
                 }));
                 break;
+              }
+              if (deliveredUserIds.length > 0) {
+                await database.query(
+                  `UPDATE app_message_receipts
+                   SET delivered_at = COALESCE(delivered_at, now()),
+                       receipt_state = CASE WHEN receipt_state = 'read' THEN 'read' ELSE 'delivered' END
+                   WHERE message_id = $1 AND user_id = ANY($2::uuid[])`,
+                  [messageId, deliveredUserIds],
+                );
+                await database.query(
+                  `UPDATE app_messages
+                   SET status = CASE WHEN status = 'read' THEN 'read' ELSE 'delivered' END
+                   WHERE id = $1 AND conversation_id = $2`,
+                  [messageId, conversationId],
+                );
               }
               const recipientOnline = recipientDeliveredCount > 0 || hasBotMember;
               ws.send(JSON.stringify({
@@ -608,24 +635,86 @@ export function createRealtimeGateway(
             )).slice(0, 100);
             if (messageIds.length === 0) break;
             const updated = await database.query<{ id: string }>(
-              `UPDATE app_messages m
-               SET status = 'read'
-               WHERE m.id = ANY($1::uuid[]) AND m.conversation_id = $2
-                 AND m.sender_id <> $3 AND m.status <> 'read'
+              `UPDATE app_message_receipts receipt
+               SET delivered_at = COALESCE(receipt.delivered_at, now()),
+                   read_at = COALESCE(receipt.read_at, now()),
+                   receipt_state = 'read'
+               FROM app_messages message
+               JOIN app_users reader
+                 ON reader.id = $3 AND reader.read_receipts_enabled = true
+               WHERE receipt.message_id = message.id
+                 AND receipt.user_id = reader.id
+                 AND message.id = ANY($1::uuid[])
+                 AND message.conversation_id = $2
+                 AND message.sender_id <> $3
                  AND EXISTS (
                    SELECT 1 FROM app_conversation_members member
-                   WHERE member.conversation_id = m.conversation_id AND member.user_id = $3
+                   WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
                  )
-               RETURNING m.id`,
+               RETURNING receipt.message_id AS id`,
               [messageIds, msg.conversationId, client.userId],
             );
             if (updated.rows.length > 0) {
-              msg.payload = {
-                messageIds: updated.rows.map((row) => row.id),
-                conversationId: msg.conversationId,
-                status: "read",
-              };
-              await broadcastToConversation(msg, msg.conversationId, client.userId, clientId);
+              const updatedIds = updated.rows.map((row) => row.id);
+              await database.query(
+                `UPDATE app_messages
+                 SET status = CASE WHEN status = 'read' THEN 'read' ELSE 'delivered' END
+                 WHERE id = ANY($1::uuid[]) AND conversation_id = $2`,
+                [updatedIds, msg.conversationId],
+              );
+              const fullyRead = await database.query<{ id: string }>(
+                `UPDATE app_messages message
+                 SET status = 'read'
+                 WHERE message.id = ANY($1::uuid[]) AND message.conversation_id = $2
+                   AND EXISTS (
+                     SELECT 1
+                     FROM app_message_receipts receipt
+                     JOIN app_users recipient ON recipient.id = receipt.user_id
+                     JOIN app_conversation_members member
+                       ON member.conversation_id = message.conversation_id
+                      AND member.user_id = receipt.user_id
+                     WHERE receipt.message_id = message.id AND recipient.read_receipts_enabled = true
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM app_message_receipts receipt
+                     JOIN app_users recipient ON recipient.id = receipt.user_id
+                     JOIN app_conversation_members member
+                       ON member.conversation_id = message.conversation_id
+                      AND member.user_id = receipt.user_id
+                     WHERE receipt.message_id = message.id
+                       AND recipient.read_receipts_enabled = true
+                       AND receipt.receipt_state <> 'read'
+                   )
+                 RETURNING message.id`,
+                [updatedIds, msg.conversationId],
+              );
+              const fullyReadIds = new Set(fullyRead.rows.map((row) => row.id));
+              const notFullyReadIds = updatedIds.filter((id) => !fullyReadIds.has(id));
+              if (notFullyReadIds.length > 0) {
+                await broadcastToConversation({
+                  type: "chat:read",
+                  conversationId: msg.conversationId,
+                  payload: {
+                    messageIds: notFullyReadIds,
+                    conversationId: msg.conversationId,
+                    readerId: client.userId,
+                    status: "delivered",
+                  },
+                }, msg.conversationId, client.userId, clientId);
+              }
+              if (fullyReadIds.size > 0) {
+                await broadcastToConversation({
+                  type: "chat:read",
+                  conversationId: msg.conversationId,
+                  payload: {
+                    messageIds: [...fullyReadIds],
+                    conversationId: msg.conversationId,
+                    readerId: client.userId,
+                    status: "read",
+                  },
+                }, msg.conversationId, client.userId, clientId);
+              }
             }
             break;
           }
@@ -771,18 +860,31 @@ export function createRealtimeGateway(
             if (database && msg.conversationId && client.userId) {
               if (msg.type === "chat:status") {
                 const status = msg.payload?.status;
-                if (status !== "delivered" && status !== "read") break;
-                const updated = await database.query(
-                  `UPDATE app_messages m
-                   SET status = CASE WHEN $1 = 'read' THEN 'read' ELSE 'delivered' END
-                   WHERE m.id = $2 AND m.conversation_id = $3 AND m.sender_id <> $4 AND m.status <> 'read'
+                if (status !== "delivered") break;
+                const updated = await database.query<{ id: string }>(
+                  `UPDATE app_message_receipts receipt
+                   SET delivered_at = COALESCE(receipt.delivered_at, now()),
+                       receipt_state = CASE WHEN receipt.receipt_state = 'read' THEN 'read' ELSE 'delivered' END
+                   FROM app_messages message
+                   WHERE receipt.message_id = message.id
+                     AND receipt.user_id = $4
+                     AND message.id = $1
+                     AND message.conversation_id = $2
+                     AND message.sender_id <> $3
                      AND EXISTS (
                        SELECT 1 FROM app_conversation_members member
-                       WHERE member.conversation_id = m.conversation_id AND member.user_id = $4
-                     )`,
-                  [status, msg.payload?.messageId, msg.conversationId, client.userId],
+                       WHERE member.conversation_id = message.conversation_id AND member.user_id = $3
+                     )
+                   RETURNING receipt.message_id AS id`,
+                  [msg.payload?.messageId, msg.conversationId, client.userId],
                 );
-                if (updated.rowCount === 0) break;
+                if (updated.rows.length === 0) break;
+                await database.query(
+                  `UPDATE app_messages
+                   SET status = CASE WHEN status = 'read' THEN 'read' ELSE 'delivered' END
+                   WHERE id = $1 AND conversation_id = $2`,
+                  [msg.payload?.messageId, msg.conversationId],
+                );
               } else if (msg.type === "chat:delete") {
                 const messageId = msg.payload?.messageId;
                 if (typeof messageId !== "string" || !/^[0-9a-f-]{36}$/i.test(messageId)) break;

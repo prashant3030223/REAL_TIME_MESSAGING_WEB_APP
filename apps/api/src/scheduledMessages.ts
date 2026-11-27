@@ -98,6 +98,14 @@ export async function processDueScheduledMessages(
       if (!createdAt) {
         throw new Error("Scheduled message delivery did not create a message row.");
       }
+      await client.query(
+        `INSERT INTO app_message_receipts (message_id, user_id)
+         SELECT $1, member.user_id
+         FROM app_conversation_members member
+         WHERE member.conversation_id = $2 AND member.user_id <> $3
+         ON CONFLICT (message_id, user_id) DO NOTHING`,
+        [message.id, message.conversation_id, message.sender_id],
+      );
 
       const scheduledFor = new Date(message.scheduled_for).toISOString();
       deliveredMessage = {

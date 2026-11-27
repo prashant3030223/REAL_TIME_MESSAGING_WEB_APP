@@ -39,16 +39,20 @@ test("due scheduled messages are persisted before realtime delivery", async () =
           rowCount: 1,
         };
       }
-      if (query.includes("FROM app_conversation_members")) {
-        assert.deepEqual(values, [conversationId, senderId]);
-        return { rows: [{}], rowCount: 1 };
-      }
       if (query.includes("INSERT INTO app_messages")) {
         assert.deepEqual(values.slice(0, 4), [messageId, conversationId, senderId, "Deliver this"]);
         assert.ok(statements.includes("BEGIN"));
         assert.equal(values[5], 24);
         assert.match(query, /expires_at/);
         return { rows: [{ created_at: createdAt, expires_at: expiresAt }], rowCount: 1 };
+      }
+      if (query.includes("INSERT INTO app_message_receipts")) {
+        assert.deepEqual(values, [messageId, conversationId, senderId]);
+        return { rows: [], rowCount: 1 };
+      }
+      if (query.includes("FROM app_conversation_members")) {
+        assert.deepEqual(values, [conversationId, senderId]);
+        return { rows: [{}], rowCount: 1 };
       }
       if (query.includes("UPDATE app_scheduled_messages")) {
         assert.deepEqual(values, [messageId]);

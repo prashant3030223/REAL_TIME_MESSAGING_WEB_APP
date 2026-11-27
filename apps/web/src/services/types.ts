@@ -12,6 +12,7 @@ export type User = {
   phone?: string;
   isVerified?: boolean;
   profilePhotoProtection?: ProfilePhotoProtection;
+  readReceiptsEnabled?: boolean;
 };
 
 export type MessageStatus = "scheduled" | "pending" | "sent" | "delivered" | "read" | "failed";
@@ -82,6 +83,15 @@ export type Message = {
   expiresAt?: string | undefined;
   targetUserId?: string | undefined;
   targetPhone?: string | undefined;
+};
+
+export type MessageReadReceipt = {
+  userId: string;
+  name: string;
+  avatar: string;
+  status: "sent" | "delivered" | "read" | "unavailable" | "unknown";
+  deliveredAt?: string | null;
+  readAt?: string | null;
 };
 
 export type ConversationMember = {

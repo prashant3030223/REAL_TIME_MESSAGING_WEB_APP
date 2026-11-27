@@ -52,7 +52,15 @@ import {
   Share2,
   Upload,
 } from "lucide-react";
-import type { Conversation, Message, SharedContact, User, PollData, PollOption } from "../services/types.js";
+import type {
+  Conversation,
+  Message,
+  MessageReadReceipt,
+  SharedContact,
+  User,
+  PollData,
+  PollOption,
+} from "../services/types.js";
 import { AudioPlayer } from "../components/AudioPlayer.js";
 import { soundFx } from "../services/soundFx.js";
 import { realtime } from "../services/realtime.js";
@@ -600,6 +608,10 @@ export function ChatsView({
   const [pollFormError, setPollFormError] = useState<string | null>(null);
   const [pendingPollVoteId, setPendingPollVoteId] = useState<string | null>(null);
   const [infoModalMsg, setInfoModalMsg] = useState<Message | null>(null);
+  const [infoReadReceipts, setInfoReadReceipts] = useState<MessageReadReceipt[]>([]);
+  const [infoReadReceiptsLoading, setInfoReadReceiptsLoading] = useState(false);
+  const [infoReadReceiptsError, setInfoReadReceiptsError] = useState<string | null>(null);
+  const infoReadReceiptRequestId = useRef(0);
   const [copiedToast, setCopiedToast] = useState<string | null>(null);
   const [manualInviteUrl, setManualInviteUrl] = useState<string | null>(null);
   const [lookupError, setLookupError] = useState<string | null>(null);
@@ -608,6 +620,57 @@ export function ChatsView({
   const composerLinkPreviews = composerLinks.some((link) => link.url === dismissedComposerLinkUrl)
     ? []
     : composerLinks;
+
+  const refreshInfoReadReceipts = useCallback(async () => {
+    const message = infoModalMsg;
+    const requestId = ++infoReadReceiptRequestId.current;
+    if (!message || message.senderId !== currentUser.id) {
+      setInfoReadReceipts([]);
+      setInfoReadReceiptsError(null);
+      setInfoReadReceiptsLoading(false);
+      return;
+    }
+
+    setInfoReadReceiptsLoading(true);
+    setInfoReadReceipts([]);
+    setInfoReadReceiptsError(null);
+    try {
+      const response = await fetch(
+        `/api/conversations/${encodeURIComponent(message.conversationId)}/messages/${encodeURIComponent(message.id)}/read-receipts`,
+      );
+      const result = await response.json() as {
+        receipts?: MessageReadReceipt[];
+        error?: { message?: string };
+      };
+      if (!response.ok || !Array.isArray(result.receipts)) {
+        throw new Error(result.error?.message || "Could not load receipt details.");
+      }
+      if (requestId === infoReadReceiptRequestId.current) {
+        setInfoReadReceipts(result.receipts);
+      }
+    } catch (error) {
+      if (requestId === infoReadReceiptRequestId.current) {
+        setInfoReadReceiptsError(
+          error instanceof Error ? error.message : "Could not load receipt details.",
+        );
+      }
+    } finally {
+      if (requestId === infoReadReceiptRequestId.current) {
+        setInfoReadReceiptsLoading(false);
+      }
+    }
+  }, [currentUser.id, infoModalMsg]);
+
+  useEffect(() => {
+    void refreshInfoReadReceipts();
+  }, [refreshInfoReadReceipts]);
+
+  useEffect(() => {
+    if (!infoModalMsg || infoModalMsg.senderId !== currentUser.id) return;
+    return realtime.subscribe("chat:read", (data: { messageIds?: string[] }) => {
+      if (data.messageIds?.includes(infoModalMsg.id)) void refreshInfoReadReceipts();
+    });
+  }, [currentUser.id, infoModalMsg, refreshInfoReadReceipts]);
 
   async function shareMyInviteLink() {
     setManualInviteUrl(null);
@@ -4311,6 +4374,60 @@ export function ChatsView({
                       <div className="message-info-status-note">
                         Waiting for delivery confirmation
                       </div>
+                    )}
+                    {infoModalMsg.senderId === currentUser.id && (
+                      <section className="message-info-receipts" aria-live="polite">
+                        <h4>Recipients</h4>
+                        {infoReadReceiptsLoading && (
+                          <p className="message-info-receipts-note">Loading receipt details…</p>
+                        )}
+                        {infoReadReceiptsError && (
+                          <p className="message-info-receipts-note is-error" role="alert">
+                            {infoReadReceiptsError}
+                          </p>
+                        )}
+                        {!infoReadReceiptsLoading && !infoReadReceiptsError &&
+                          infoReadReceipts.length === 0 && (
+                            <p className="message-info-receipts-note">No recipient details are available.</p>
+                          )}
+                        {infoReadReceipts.length > 0 && (
+                          <ul>
+                            {infoReadReceipts.map((receipt) => {
+                              const timestamp = receipt.readAt ?? receipt.deliveredAt ?? null;
+                              const statusLabel = receipt.status === "read"
+                                ? "Read"
+                                : receipt.status === "delivered"
+                                  ? "Delivered"
+                                  : receipt.status === "sent"
+                                    ? "Waiting for delivery"
+                                    : receipt.status === "unavailable"
+                                      ? "Status unavailable"
+                                      : "Not available";
+                              return (
+                                <li key={receipt.userId}>
+                                  <img
+                                    src={getSafeAvatar(receipt.avatar, receipt.name)}
+                                    alt=""
+                                    aria-hidden="true"
+                                  />
+                                  <span className="message-info-recipient-name">{receipt.name}</span>
+                                  <span className={`message-info-recipient-status is-${receipt.status}`}>
+                                    {statusLabel}
+                                  </span>
+                                  {timestamp && (
+                                    <time dateTime={timestamp}>
+                                      {parseMessageDate(timestamp)?.toLocaleString([], {
+                                        dateStyle: "medium",
+                                        timeStyle: "short",
+                                      }) ?? timestamp}
+                                    </time>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        )}
+                      </section>
                     )}
                     <div className="message-info-footer">
                       <ShieldCheck size={15} />

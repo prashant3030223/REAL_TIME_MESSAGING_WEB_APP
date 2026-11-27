@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   User as UserIcon,
   Shield,
@@ -37,6 +37,7 @@ type SettingsViewProps = {
   onUpdatePin: (pin: string | null) => void;
   accessibility: AccessibilitySettings;
   onUpdateAccessibility: (settings: AccessibilitySettings) => void;
+  onUpdateReadReceipts: (enabled: boolean) => Promise<void>;
   onSignOut: () => Promise<void>;
 };
 
@@ -50,6 +51,7 @@ export function SettingsView({
   onUpdatePin,
   accessibility,
   onUpdateAccessibility,
+  onUpdateReadReceipts,
   onSignOut,
 }: SettingsViewProps) {
   const [activeSection, setActiveSection] = useState<
@@ -74,7 +76,13 @@ export function SettingsView({
 
   // Privacy toggles state (local simulation for UI completeness)
   const [showOnlineStatus, setShowOnlineStatus] = useState(true);
-  const [sendReadReceipts, setSendReadReceipts] = useState(true);
+  const [sendReadReceipts, setSendReadReceipts] = useState(currentUser.readReceiptsEnabled ?? true);
+  const [savingReadReceipts, setSavingReadReceipts] = useState(false);
+  const [readReceiptsError, setReadReceiptsError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setSendReadReceipts(currentUser.readReceiptsEnabled ?? true);
+  }, [currentUser.id, currentUser.readReceiptsEnabled]);
 
   async function handleSignOut() {
     setSigningOut(true);
@@ -85,6 +93,23 @@ export function SettingsView({
       setSignOutError(error instanceof Error ? error.message : "Could not sign out. Please try again.");
     } finally {
       setSigningOut(false);
+    }
+  }
+
+  async function handleReadReceiptsChange(enabled: boolean) {
+    const previousValue = sendReadReceipts;
+    setSendReadReceipts(enabled);
+    setSavingReadReceipts(true);
+    setReadReceiptsError(null);
+    try {
+      await onUpdateReadReceipts(enabled);
+    } catch (error) {
+      setSendReadReceipts(currentUser.readReceiptsEnabled ?? previousValue);
+      setReadReceiptsError(
+        error instanceof Error ? error.message : "Could not update read receipt settings.",
+      );
+    } finally {
+      setSavingReadReceipts(false);
     }
   }
 
@@ -647,15 +672,22 @@ export function SettingsView({
                 <label className="toggle-setting-row">
                   <div>
                     <strong>Send Read Receipts</strong>
-                    <p>Show double blue checkmarks when you read incoming messages</p>
+                    <p>Let others see when you read their messages. Turn off to hide your read status.</p>
                   </div>
                   <input
                     type="checkbox"
                     checked={sendReadReceipts}
-                    onChange={(e) => setSendReadReceipts(e.target.checked)}
+                    onChange={(e) => void handleReadReceiptsChange(e.target.checked)}
+                    disabled={savingReadReceipts}
+                    aria-describedby={readReceiptsError ? "read-receipts-error" : undefined}
                     className="toggle-checkbox"
                   />
                 </label>
+                {readReceiptsError && (
+                  <p id="read-receipts-error" className="settings-error-banner" role="alert">
+                    {readReceiptsError}
+                  </p>
+                )}
 
                 <label className="toggle-setting-row">
                   <div>

@@ -67,6 +67,7 @@ export type PublicUser = {
   bio?: string | null;
   statusText?: string | null;
   profilePhotoProtection?: "nobody" | "contacts" | "everyone" | null;
+  readReceiptsEnabled?: boolean;
 };
 
 type StoredPassword = {
@@ -170,6 +171,9 @@ function publicUser(user: PublicUser) {
     bio: user.bio || "Hey there! I am using ConnectSphere.",
     ...(user.statusText ? { statusText: user.statusText } : {}),
     profilePhotoProtection: user.profilePhotoProtection || "nobody",
+    ...(typeof user.readReceiptsEnabled === "boolean"
+      ? { readReceiptsEnabled: user.readReceiptsEnabled }
+      : {}),
   };
 }
 
@@ -367,7 +371,8 @@ export function createAuthRouter(
       try {
         const userRes = await database.query<PublicUser>(
           `SELECT id, phone, email, username, display_name AS "displayName", avatar, bio,
-                  status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection"
+                  status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                  read_receipts_enabled AS "readReceiptsEnabled"
            FROM app_users
            WHERE phone = $1`,
           [cleanPhone],
@@ -381,7 +386,8 @@ export function createAuthRouter(
             `INSERT INTO app_users (phone, username, display_name, avatar, bio)
              VALUES ($1, $2, $3, $4, $5)
              RETURNING id, phone, email, username, display_name AS "displayName", avatar, bio,
-                       status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection"`,
+                       status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                       read_receipts_enabled AS "readReceiptsEnabled"`,
             [
               cleanPhone,
               defaultUsername,
@@ -460,7 +466,8 @@ export function createAuthRouter(
                updated_at = now()
            WHERE id = $7
            RETURNING id, phone, email, username, display_name AS "displayName", avatar, bio,
-                     status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection"`,
+                     status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                     read_receipts_enabled AS "readReceiptsEnabled"`,
           [displayName || null, username || null, avatar || null, bio || null, statusText || null, profilePhotoProtection || null, userId],
         );
 
@@ -499,6 +506,29 @@ export function createAuthRouter(
     throw new ApiError(401, "UNAUTHENTICATED", "Sign in to update profile.");
   });
 
+  router.patch("/privacy-settings", async (request, response) => {
+    const parsed = z.object({ readReceiptsEnabled: z.boolean() }).strict().safeParse(request.body);
+    if (!parsed.success) throw validationError();
+    databaseRequired(database);
+
+    const token = request.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
+    const userId = await resolveSessionUserId(database, token);
+    if (!userId) throw new ApiError(401, "UNAUTHENTICATED", "Sign in to update privacy settings.");
+
+    const result = await database.query<PublicUser>(
+      `UPDATE app_users
+       SET read_receipts_enabled = $1, updated_at = now()
+       WHERE id = $2
+       RETURNING id, email, phone, username, display_name AS "displayName", avatar, bio,
+                 status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                 read_receipts_enabled AS "readReceiptsEnabled"`,
+      [parsed.data.readReceiptsEnabled, userId],
+    );
+    const user = result.rows[0];
+    if (!user) throw new ApiError(401, "UNAUTHENTICATED", "Sign in to update privacy settings.");
+    response.status(200).json({ user: publicUser(user) });
+  });
+
   // 4. Standard Registration (Email & Password)
   router.post("/register", limiter, async (request, response) => {
     databaseRequired(database);
@@ -518,7 +548,8 @@ export function createAuthRouter(
       const inserted = await client.query<PublicUser>(
         `INSERT INTO app_users (email, username, display_name, password_hash, avatar, bio)
          VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection"`,
+         RETURNING id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                   read_receipts_enabled AS "readReceiptsEnabled"`,
         [email, finalUsername, finalDisplayName, passwordHash, finalAvatar, "Hey there! I am using ConnectSphere."],
       );
       const user = inserted.rows[0];
@@ -547,7 +578,8 @@ export function createAuthRouter(
     const { email, password } = parsed.data;
 
     const result = await database.query<PublicUser & StoredPassword>(
-      `SELECT id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection", password_hash
+      `SELECT id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+              read_receipts_enabled AS "readReceiptsEnabled", password_hash
        FROM app_users
        WHERE LOWER(email) = LOWER($1) OR LOWER(username) = LOWER($1)`,
       [email],
@@ -652,7 +684,8 @@ export function createAuthRouter(
         `UPDATE app_users
          SET password_hash = $1, updated_at = now()
          WHERE LOWER(email) = LOWER($2)
-         RETURNING id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection"`,
+         RETURNING id, email, username, display_name AS "displayName", avatar, bio, status_text AS "statusText", profile_photo_protection AS "profilePhotoProtection",
+                   read_receipts_enabled AS "readReceiptsEnabled"`,
         [passwordHash, email],
       );
       if (!updated.rows[0]) {
@@ -689,7 +722,8 @@ export function createAuthRouter(
     if (database) {
       const result = await database.query<PublicUser>(
         `SELECT u.id, u.email, u.phone, u.username, u.display_name AS "displayName", u.avatar, u.bio,
-                u.status_text AS "statusText", u.profile_photo_protection AS "profilePhotoProtection"
+                u.status_text AS "statusText", u.profile_photo_protection AS "profilePhotoProtection",
+                u.read_receipts_enabled AS "readReceiptsEnabled"
          FROM app_sessions s
          JOIN app_users u ON u.id = s.user_id
          WHERE s.token_hash = $1

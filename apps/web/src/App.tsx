@@ -299,7 +299,7 @@ export function App() {
     const unreadIds = unreadIncoming
       .map((message) => message.id)
       .filter((messageId) => !sentReadReceiptsRef.current.has(messageId));
-    if (unreadIds.length > 0) {
+    if (currentUser.readReceiptsEnabled !== false && unreadIds.length > 0) {
       unreadIds.forEach((messageId) => sentReadReceiptsRef.current.add(messageId));
       realtime.sendReadReceipts(activeConversationId, unreadIds);
     }
@@ -633,11 +633,15 @@ export function App() {
       soundFx.playChatNotification();
 
       // Return delivered or read status
-      if (status === "read") {
+      if (status === "read" && currentUser.readReceiptsEnabled !== false) {
         sentReadReceiptsRef.current.add(incomingMsg.id);
         realtime.sendReadReceipts(incomingMsg.conversationId, [incomingMsg.id]);
       } else {
-        realtime.sendStatus(incomingMsg.id, incomingMsg.conversationId, status);
+        realtime.sendStatus(
+          incomingMsg.id,
+          incomingMsg.conversationId,
+          status === "read" ? "delivered" : status,
+        );
       }
     });
 
@@ -672,10 +676,12 @@ export function App() {
         const convIds = data.conversationId ? [data.conversationId] : Object.keys(prev);
         for (const cid of convIds) {
           const list = prev[cid];
-          if (!list || !list.some((m) => m.id === targetId)) continue;
+          if (!list || !list.some((m) => m.id === targetId && m.senderId === currentUser.id)) continue;
           changed = true;
           updated[cid] = list.map((m) =>
-            m.id === targetId ? { ...m, status: advanceMessageStatus(m.status, targetStatus) } : m
+            m.id === targetId && m.senderId === currentUser.id
+              ? { ...m, status: advanceMessageStatus(m.status, targetStatus) }
+              : m
           );
         }
         if (!changed) return prev;
@@ -686,7 +692,7 @@ export function App() {
       setConversations((prev) => {
         let changed = false;
         const updated = prev.map((c) => {
-          if (c.lastMessage && c.lastMessage.id === targetId) {
+          if (c.lastMessage && c.lastMessage.id === targetId && c.lastMessage.senderId === currentUser.id) {
             changed = true;
             return {
               ...c,
@@ -705,9 +711,14 @@ export function App() {
       });
     });
 
-    const unsubRead = realtime.subscribe("chat:read", (data: { messageIds?: string[]; conversationId?: string; status?: "read" }) => {
-      if (!Array.isArray(data?.messageIds) || data.messageIds.length === 0) return;
+    const unsubRead = realtime.subscribe("chat:read", (data: {
+      messageIds?: string[];
+      conversationId?: string;
+      status?: "delivered" | "read";
+    }) => {
+      if (!data?.status || !Array.isArray(data.messageIds) || data.messageIds.length === 0) return;
       const readIds = new Set(data.messageIds);
+      const readStatus = data.status;
 
       setMessages((previous) => {
         let changed = false;
@@ -715,11 +726,11 @@ export function App() {
         const convIds = data.conversationId ? [data.conversationId] : Object.keys(previous);
         for (const cid of convIds) {
           const list = previous[cid];
-          if (!list || !list.some((m) => readIds.has(m.id))) continue;
+          if (!list || !list.some((m) => readIds.has(m.id) && m.senderId === currentUser.id)) continue;
           changed = true;
           updated[cid] = list.map((message) =>
-            readIds.has(message.id)
-              ? { ...message, status: advanceMessageStatus(message.status, "read") }
+            readIds.has(message.id) && message.senderId === currentUser.id
+              ? { ...message, status: advanceMessageStatus(message.status, readStatus) }
               : message
           );
         }
@@ -731,13 +742,17 @@ export function App() {
       setConversations((prev) => {
         let changed = false;
         const updated = prev.map((c) => {
-          if (c.lastMessage && readIds.has(c.lastMessage.id)) {
+          if (
+            c.lastMessage &&
+            readIds.has(c.lastMessage.id) &&
+            c.lastMessage.senderId === currentUser.id
+          ) {
             changed = true;
             return {
               ...c,
               lastMessage: {
                 ...c.lastMessage,
-                status: advanceMessageStatus(c.lastMessage.status, "read"),
+                status: advanceMessageStatus(c.lastMessage.status, readStatus),
               },
             };
           }
@@ -1954,6 +1969,19 @@ export function App() {
                 storage.saveAccessibility(acc);
                 soundFx.setEnabled(acc.soundFeedback);
                 if (acc.soundFeedback) soundFx.unlockAudio();
+              }}
+              onUpdateReadReceipts={async (enabled) => {
+                const response = await fetch("/api/auth/privacy-settings", {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ readReceiptsEnabled: enabled }),
+                });
+                const result = await response.json() as { user?: User; error?: { message?: string } };
+                if (!response.ok || !result.user) {
+                  throw new Error(result.error?.message || "Could not update read receipt settings.");
+                }
+                setCurrentUser(result.user);
+                storage.saveUser(result.user);
               }}
               onSignOut={async () => {
                 const response = await fetch("/api/auth/logout", {

@@ -305,6 +305,8 @@ test("authenticated call signaling is routed only to participants, including pho
   ]);
   const extraUserIds = Array.from({ length: 7 }, (_, index) => `extra-user-${index + 1}`);
   const overflowUserId = "overflow-user";
+  let readReceiptsEnabled = true;
+  const readsByMessage = new Map<string, Set<string>>();
   for (const [index, userId] of [...extraUserIds, overflowUserId].entries()) {
     profiles.set(userId, {
       username: userId,
@@ -331,14 +333,42 @@ test("authenticated call signaling is routed only to participants, including pho
         );
         return { rows: match ? [{ id: match[0] }] : [] };
       }
+      if (sql.includes("UPDATE app_message_receipts receipt")) {
+        assert.match(sql, /read_receipts_enabled = true/);
+        if (!readReceiptsEnabled) return { rows: [] };
+        const ids = Array.isArray(values[0]) ? values[0] as string[] : [String(values[0])];
+        const readerId = String(values[2]);
+        for (const id of ids) {
+          const readers = readsByMessage.get(id) ?? new Set<string>();
+          readers.add(readerId);
+          readsByMessage.set(id, readers);
+        }
+        return { rows: ids.map((id) => ({ id })) };
+      }
+      if (sql.includes("UPDATE app_messages message")) {
+        const ids = values[0] as string[];
+        const completed = ids.filter((id) => {
+          const readers = readsByMessage.get(id);
+          return readers?.has("callee-user") && readers.has(extraUserIds[0] ?? "");
+        });
+        return { rows: completed.map((id) => ({ id })) };
+      }
+      if (
+        sql.includes("UPDATE app_messages") &&
+        !sql.includes("UPDATE app_messages m") &&
+        !sql.includes("UPDATE app_messages AS m")
+      ) {
+        return { rows: [], rowCount: 1 };
+      }
       if (sql.includes("UPDATE app_messages m")) {
         return { rows: (values[0] as string[]).map((id) => ({ id })) };
       }
       if (sql.includes("SELECT member.user_id, conversation.type")) {
         return {
           rows: [
-            { user_id: "caller-user", type: "direct" },
-            { user_id: "callee-user", type: "direct" },
+            { user_id: "caller-user", type: "group" },
+            { user_id: "callee-user", type: "group" },
+            { user_id: extraUserIds[0], type: "group" },
           ],
         };
       }
@@ -544,17 +574,47 @@ test("authenticated call signaling is routed only to participants, including pho
     }));
 
     const messageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
-    const readReceiptPromise = caller.waitFor((message) =>
-      message.type === "chat:read" && message.payload.messageIds?.includes(messageId)
+    const partialReadPromise = caller.waitFor((message) =>
+      message.type === "chat:read" &&
+      message.payload.messageIds?.includes(messageId) &&
+      message.payload.status === "delivered"
     );
     callee.ws.send(JSON.stringify({
       type: "chat:read",
       conversationId: "conversation-1",
       payload: { messageIds: [messageId] },
     }));
-    const readReceipt = await readReceiptPromise;
-    assert.deepEqual(readReceipt.payload.messageIds, [messageId]);
-    assert.equal(readReceipt.payload.status, "read");
+    const partialRead = await partialReadPromise;
+    assert.deepEqual(partialRead.payload.messageIds, [messageId]);
+    assert.equal(partialRead.payload.status, "delivered");
+
+    const fullReadPromise = caller.waitFor((message) =>
+      message.type === "chat:read" &&
+      message.payload.messageIds?.includes(messageId) &&
+      message.payload.status === "read"
+    );
+    extraClients[0]?.ws.send(JSON.stringify({
+      type: "chat:read",
+      conversationId: "conversation-1",
+      payload: { messageIds: [messageId] },
+    }));
+    const fullRead = await fullReadPromise;
+    assert.equal(fullRead.payload.status, "read");
+
+    readReceiptsEnabled = false;
+    const privateMessageId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    callee.ws.send(JSON.stringify({
+      type: "chat:read",
+      conversationId: "conversation-1",
+      payload: { messageIds: [privateMessageId] },
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(
+      caller.hasMessage((message) =>
+        message.type === "chat:read" && message.payload.messageIds?.includes(privateMessageId)
+      ),
+      false,
+    );
 
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(outsider.hasMessage((message) => message.callId === callId), false);

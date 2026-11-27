@@ -56,6 +56,122 @@ test("liveness endpoint returns a request ID and healthy response", async () => 
   });
 });
 
+test("read receipt privacy preference is persisted for the authenticated user", async () => {
+  const sessionToken = randomBytes(32).toString("base64url");
+  const userId = "00000000-0000-4000-8000-000000000021";
+  let savedValue: boolean | undefined;
+  const database = {
+    query: async (sql: string, values: unknown[] = []) => {
+      if (sql.includes("SELECT user_id FROM app_sessions")) {
+        return { rows: [{ user_id: userId }] };
+      }
+      if (sql.includes("UPDATE app_users") && sql.includes("read_receipts_enabled")) {
+        savedValue = values[0] as boolean;
+        assert.equal(values[1], userId);
+        return {
+          rows: [{
+            id: userId,
+            username: "reader",
+            displayName: "Reader",
+            readReceiptsEnabled: savedValue,
+          }],
+        };
+      }
+      throw new Error(`Unexpected privacy-settings query: ${sql}`);
+    },
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/auth/privacy-settings`, {
+      method: "PATCH",
+      headers: {
+        "content-type": "application/json",
+        cookie: `${SESSION_COOKIE_NAME}=${sessionToken}`,
+      },
+      body: JSON.stringify({ readReceiptsEnabled: false }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(savedValue, false);
+    assert.equal((await response.json() as { user: { readReceiptsEnabled: boolean } }).user.readReceiptsEnabled, false);
+  });
+});
+
+test("read receipt details show timestamps only when a recipient allows them", async () => {
+  const senderId = "00000000-0000-4000-8000-000000000031";
+  const readerId = "00000000-0000-4000-8000-000000000032";
+  const hiddenId = "00000000-0000-4000-8000-000000000033";
+  const conversationId = "00000000-0000-4000-8000-000000000034";
+  const messageId = "00000000-0000-4000-8000-000000000035";
+  const tokens = new Map<string, string>();
+  const tokenFor = (userId: string) => {
+    const token = randomBytes(32).toString("base64url");
+    tokens.set(createHash("sha256").update(token).digest("hex"), userId);
+    return token;
+  };
+  const senderToken = tokenFor(senderId);
+  const recipientToken = tokenFor(readerId);
+  const database = {
+    query: async (sql: string, values: unknown[] = []) => {
+      if (sql.includes("SELECT user_id FROM app_sessions")) {
+        const userId = tokens.get((values[0] as Buffer).toString("hex"));
+        return { rows: userId ? [{ user_id: userId }] : [] };
+      }
+      if (sql.includes("SELECT 1 FROM app_conversation_members own")) {
+        return { rows: [{ "?column?": 1 }], rowCount: 1 };
+      }
+      if (sql.includes("SELECT sender_id") && sql.includes("FROM app_messages")) {
+        return { rows: [{ sender_id: senderId }] };
+      }
+      if (sql.includes("LEFT JOIN app_message_receipts")) {
+        assert.match(sql, /CASE WHEN recipient\.read_receipts_enabled THEN receipt\.read_at END/);
+        return {
+          rows: [
+            {
+              userId: readerId,
+              name: "Reader",
+              avatar: "/reader.png",
+              status: "read",
+              deliveredAt: "2025-01-01T12:00:00.000Z",
+              readAt: "2025-01-01T12:01:00.000Z",
+            },
+            {
+              userId: hiddenId,
+              name: "Private reader",
+              avatar: "",
+              status: "unavailable",
+              deliveredAt: null,
+              readAt: null,
+            },
+          ],
+        };
+      }
+      throw new Error(`Unexpected read-receipt query: ${sql}`);
+    },
+  } as unknown as Pool;
+
+  await withServer(database, async (baseUrl) => {
+    const endpoint = `${baseUrl}/api/conversations/${conversationId}/messages/${messageId}/read-receipts`;
+    const response = await fetch(endpoint, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${senderToken}` },
+    });
+    assert.equal(response.status, 200);
+    const result = await response.json() as {
+      receipts: Array<{ userId: string; status: string; deliveredAt?: string | null; readAt?: string | null }>;
+    };
+    assert.equal(result.receipts[0]?.status, "read");
+    assert.equal(result.receipts[0]?.readAt, "2025-01-01T12:01:00.000Z");
+    assert.equal(result.receipts[1]?.status, "unavailable");
+    assert.equal(result.receipts[1]?.deliveredAt, null);
+    assert.equal(result.receipts[1]?.readAt, null);
+
+    const forbidden = await fetch(endpoint, {
+      headers: { cookie: `${SESSION_COOKIE_NAME}=${recipientToken}` },
+    });
+    assert.equal(forbidden.status, 403);
+  });
+});
+
 test("link previews require a session and return fetched metadata", async () => {
   let fetchedUrl: string | null = null;
   let fetchCount = 0;
@@ -478,11 +594,17 @@ test("core-contact auto-read sends a live read receipt", async () => {
           }],
         };
       }
+      if (sql.includes("INSERT INTO app_message_receipts")) return { rows: [], rowCount: 1 };
       if (sql.includes("SELECT display_name, avatar FROM app_users")) {
         return { rows: [{ display_name: "Sender", avatar: null }] };
       }
       if (sql.includes("SELECT m.user_id, u.display_name, u.email")) {
         return { rows: [{ user_id: botId, display_name: "Sphere AI", email: "ai@connectsphere.io" }] };
+      }
+      if (sql.includes("UPDATE app_message_receipts")) return { rows: [{ id: messageId }] };
+      if (sql.includes("UPDATE app_messages message")) return { rows: [{ id: messageId }] };
+      if (sql.includes("SET status = CASE WHEN status = 'read' THEN 'read' ELSE 'delivered' END")) {
+        return { rows: [], rowCount: 1 };
       }
       if (sql.includes("UPDATE app_messages SET status = 'read'")) {
         return { rows: [{ id: messageId }] };

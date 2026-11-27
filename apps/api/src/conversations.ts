@@ -1229,6 +1229,62 @@ export function createConversationsRouter(
     }
   });
 
+  router.get("/:id/messages/:messageId/read-receipts", async (request, response, next) => {
+    const conversationId = request.params["id"] ?? "";
+    const messageId = request.params["messageId"] ?? "";
+    if (!z.string().uuid().safeParse(messageId).success) {
+      throw new ApiError(400, "INVALID_MESSAGE_ID", "The message id is invalid.");
+    }
+    if (!database) {
+      response.status(200).json({ receipts: [] });
+      return;
+    }
+
+    try {
+      const userId = await getUserId(request);
+      await requireMembership(conversationId, userId);
+      const message = await database.query<{ sender_id: string }>(
+        `SELECT sender_id
+         FROM app_messages
+         WHERE id = $1 AND conversation_id = $2`,
+        [messageId, conversationId],
+      );
+      if (!message.rows[0]) {
+        throw new ApiError(404, "MESSAGE_NOT_FOUND", "Message not found.");
+      }
+      if (message.rows[0].sender_id !== userId) {
+        throw new ApiError(403, "READ_RECEIPTS_FORBIDDEN", "Only the message sender can view its receipts.");
+      }
+
+      const result = await database.query(
+        `SELECT member.user_id AS "userId",
+                recipient.display_name AS name,
+                COALESCE(recipient.avatar, '') AS avatar,
+                CASE
+                  WHEN NOT recipient.read_receipts_enabled THEN 'unavailable'
+                  WHEN receipt.message_id IS NULL OR receipt.receipt_state = 'unknown' THEN 'unknown'
+                  ELSE receipt.receipt_state
+                END AS status,
+                CASE WHEN recipient.read_receipts_enabled THEN receipt.delivered_at END AS "deliveredAt",
+                CASE WHEN recipient.read_receipts_enabled THEN receipt.read_at END AS "readAt"
+         FROM app_conversation_members member
+         JOIN app_users recipient ON recipient.id = member.user_id
+         JOIN app_messages message
+           ON message.id = $1 AND message.conversation_id = member.conversation_id
+         LEFT JOIN app_message_receipts receipt
+           ON receipt.message_id = message.id AND receipt.user_id = member.user_id
+         WHERE member.conversation_id = $2
+           AND member.user_id <> message.sender_id
+           AND member.joined_at <= message.created_at
+         ORDER BY recipient.display_name, member.user_id`,
+        [messageId, conversationId],
+      );
+      response.status(200).json({ receipts: result.rows });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   router.get("/:id/messages", async (request, response, next) => {
     const conversationId = request.params["id"] ?? "";
     if (!database) {
@@ -1508,17 +1564,29 @@ export function createConversationsRouter(
       const { id, text, idempotencyKey, attachments, voiceNote, replyToId, metadata, sharedContact } = parsed.data;
       const normalizedAttachments = await normalizeR2Attachments(attachments, conversationId, userId);
       const inserted = await database.query<MessageRow>(
-        `INSERT INTO app_messages
-         (id, conversation_id, sender_id, text, attachments, voice_note, reply_to_id, idempotency_key, metadata, expires_at)
-         VALUES (
-         COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9,
-         (SELECT CASE WHEN disappearing_timer_hours > 0
-           THEN now() + make_interval(hours => disappearing_timer_hours)
-           ELSE NULL END
-          FROM app_conversations WHERE id = $2)
+        `WITH inserted AS (
+           INSERT INTO app_messages
+           (id, conversation_id, sender_id, text, attachments, voice_note, reply_to_id, idempotency_key, metadata, expires_at)
+           VALUES (
+           COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7, $8, $9,
+           (SELECT CASE WHEN disappearing_timer_hours > 0
+             THEN now() + make_interval(hours => disappearing_timer_hours)
+             ELSE NULL END
+            FROM app_conversations WHERE id = $2)
+           )
+           ON CONFLICT (conversation_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+           RETURNING id, conversation_id, sender_id, text, attachments, voice_note, status, metadata, created_at, expires_at
+         ),
+         receipt_insertions AS (
+           INSERT INTO app_message_receipts (message_id, user_id)
+           SELECT inserted.id, member.user_id
+           FROM inserted
+           JOIN app_conversation_members member ON member.conversation_id = inserted.conversation_id
+           WHERE member.user_id <> inserted.sender_id
+           ON CONFLICT (message_id, user_id) DO NOTHING
+           RETURNING message_id
          )
-         ON CONFLICT (conversation_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
-         RETURNING id, conversation_id, sender_id, text, attachments, voice_note, status, metadata, created_at, expires_at`,
+         SELECT inserted.* FROM inserted`,
         [
           id ?? null,
           conversationId,
@@ -1588,17 +1656,62 @@ export function createConversationsRouter(
             try {
               // Mark user's message as read by bot
               const readMessages = await database.query<{ id: string }>(
-                `UPDATE app_messages SET status = 'read'
-                 WHERE conversation_id = $1 AND sender_id = $2 AND status <> 'read'
-                 RETURNING id`,
-                [conversationId, userId],
+                `UPDATE app_message_receipts receipt
+                 SET delivered_at = COALESCE(receipt.delivered_at, now()),
+                     read_at = COALESCE(receipt.read_at, now()),
+                     receipt_state = 'read'
+                 FROM app_messages message
+                 JOIN app_users reader
+                   ON reader.id = $3 AND reader.read_receipts_enabled = true
+                 WHERE receipt.message_id = message.id
+                   AND receipt.user_id = reader.id
+                   AND message.conversation_id = $1
+                   AND message.sender_id = $2
+                 RETURNING receipt.message_id AS id`,
+                [conversationId, userId, coreBot.user_id],
               );
               if (readMessages.rows.length > 0) {
-                await notifyReadReceipt?.(
-                  conversationId,
-                  coreBot.user_id,
-                  readMessages.rows.map(({ id }) => id),
+                const readMessageIds = readMessages.rows.map(({ id }) => id);
+                await database.query(
+                  `UPDATE app_messages
+                   SET status = CASE WHEN status = 'read' THEN 'read' ELSE 'delivered' END
+                   WHERE id = ANY($1::uuid[])`,
+                  [readMessageIds],
                 );
+                const fullyRead = await database.query<{ id: string }>(
+                  `UPDATE app_messages message
+                   SET status = 'read'
+                   WHERE message.id = ANY($1::uuid[])
+                     AND EXISTS (
+                       SELECT 1
+                       FROM app_message_receipts receipt
+                       JOIN app_users recipient ON recipient.id = receipt.user_id
+                       JOIN app_conversation_members member
+                         ON member.conversation_id = message.conversation_id
+                        AND member.user_id = receipt.user_id
+                       WHERE receipt.message_id = message.id AND recipient.read_receipts_enabled = true
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM app_message_receipts receipt
+                       JOIN app_users recipient ON recipient.id = receipt.user_id
+                       JOIN app_conversation_members member
+                         ON member.conversation_id = message.conversation_id
+                        AND member.user_id = receipt.user_id
+                       WHERE receipt.message_id = message.id
+                         AND recipient.read_receipts_enabled = true
+                         AND receipt.receipt_state <> 'read'
+                     )
+                   RETURNING message.id`,
+                  [readMessageIds],
+                );
+                if (fullyRead.rows.length > 0) {
+                  await notifyReadReceipt?.(
+                    conversationId,
+                    coreBot.user_id,
+                    fullyRead.rows.map(({ id }) => id),
+                  );
+                }
               }
 
               let replyText = "Message received! ✨ Everything in ConnectSphere is operating smoothly.";
@@ -1621,9 +1734,23 @@ export function createConversationsRouter(
                 replyText = "Hey there! Ready to collaborate. You can also test the collaborative whiteboard and shared notes in the Workspace tab.";
               }
 
-              await database.query(
-                `INSERT INTO app_messages (conversation_id, sender_id, text, status)
-                 VALUES ($1, $2, $3, 'sent')`,
+              const botMessage = await database.query<{ id: string }>(
+                `WITH bot_message AS (
+                   INSERT INTO app_messages (conversation_id, sender_id, text, status)
+                   VALUES ($1, $2, $3, 'sent')
+                   RETURNING id, conversation_id, sender_id
+                 ),
+                 receipt_insertions AS (
+                   INSERT INTO app_message_receipts (message_id, user_id)
+                   SELECT bot_message.id, member.user_id
+                   FROM bot_message
+                   JOIN app_conversation_members member
+                     ON member.conversation_id = bot_message.conversation_id
+                   WHERE member.user_id <> bot_message.sender_id
+                   ON CONFLICT (message_id, user_id) DO NOTHING
+                   RETURNING message_id
+                 )
+                 SELECT id FROM bot_message`,
                 [conversationId, coreBot.user_id, replyText],
               );
               await database.query("UPDATE app_conversations SET updated_at = now() WHERE id = $1", [conversationId]);
@@ -1659,6 +1786,14 @@ export function createConversationsRouter(
       );
       const existing = duplicate.rows[0];
       if (!existing) throw new Error("Idempotent message could not be retrieved after conflict.");
+      await database.query(
+        `INSERT INTO app_message_receipts (message_id, user_id)
+         SELECT $1, member.user_id
+         FROM app_conversation_members member
+         WHERE member.conversation_id = $2 AND member.user_id <> $3
+         ON CONFLICT (message_id, user_id) DO NOTHING`,
+        [existing.id, conversationId, userId],
+      );
       response.status(200).json({ message: toMessage(existing), duplicate: true });
     } catch (error) {
       if (error instanceof ApiError) {
