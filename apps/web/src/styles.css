@@ -1101,6 +1101,11 @@ body.reduced-motion *::after {
   font-weight: 500;
 }
 
+.conv-draft-label {
+  color: #fbbf24;
+  font-weight: 700;
+}
+
 .conv-meta-badges {
   display: flex;
   align-items: center;
@@ -2156,6 +2161,34 @@ body.reduced-motion *::after {
   position: relative;
   z-index: 20;
   width: calc(100% - 32px);
+}
+
+.composer-draft-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 22px 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.composer-draft-status [role="alert"] {
+  color: #fca5a5;
+}
+
+.composer-draft-status button {
+  border: 0;
+  padding: 2px 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.composer-draft-status button:hover {
+  text-decoration: underline;
 }
 
 .chat-tool-btn,

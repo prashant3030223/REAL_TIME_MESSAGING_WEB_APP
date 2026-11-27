@@ -92,7 +92,7 @@ type ChatsViewProps = {
   messages: Record<string, Message[]>;
   activeConversationId: string;
   onSelectConversation: (id: string) => void;
-  onSendMessage: (conversationId: string, text: string, extra?: Partial<Message>) => void;
+  onSendMessage: (conversationId: string, text: string, extra?: Partial<Message>) => void | Promise<boolean>;
   onScheduleMessage: (
     conversationId: string,
     text: string,
@@ -553,7 +553,13 @@ export function ChatsView({
   const [disappearingTimerPending, setDisappearingTimerPending] = useState(false);
   const [customDisappearingTimerHours, setCustomDisappearingTimerHours] = useState("1");
   const [isCustomDisappearingTimerSelected, setIsCustomDisappearingTimerSelected] = useState(false);
-  const [inputText, setInputText] = useState("");
+  const [drafts, setDrafts] = useState<Record<string, string>>(() => storage.getDrafts(currentUser.id));
+  const draftsRef = useRef(drafts);
+  const [inputText, setInputTextState] = useState(() => drafts[activeConversationId] ?? "");
+  const inputTextRef = useRef(inputText);
+  const draftConversationIdRef = useRef(activeConversationId);
+  const isEditingMessageRef = useRef(false);
+  const [draftSaveError, setDraftSaveError] = useState<string | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [isSavingEdit, setIsSavingEdit] = useState(false);
   const [dismissedComposerLinkUrl, setDismissedComposerLinkUrl] = useState<string | null>(null);
@@ -575,6 +581,35 @@ export function ChatsView({
   const typingDebounceRef = useRef<number | null>(null);
   const typingTimersRef = useRef(new Map<string, number>());
   const typingConversationRef = useRef<string | null>(null);
+
+  function saveDraftForConversation(conversationId: string, text: string) {
+    if (!conversationId) return;
+
+    const updatedDrafts = { ...draftsRef.current };
+    if (text.length > 0) {
+      updatedDrafts[conversationId] = text;
+    } else {
+      delete updatedDrafts[conversationId];
+    }
+
+    draftsRef.current = updatedDrafts;
+    setDrafts(updatedDrafts);
+    try {
+      storage.saveDrafts(currentUser.id, updatedDrafts);
+      setDraftSaveError(null);
+    } catch {
+      setDraftSaveError("Your draft could not be saved in this browser.");
+    }
+  }
+
+  function setInputText(nextText: string | ((previous: string) => string)) {
+    const updatedText = typeof nextText === "function" ? nextText(inputTextRef.current) : nextText;
+    inputTextRef.current = updatedText;
+    setInputTextState(updatedText);
+    if (!isEditingMessageRef.current) {
+      saveDraftForConversation(draftConversationIdRef.current, updatedText);
+    }
+  }
 
   // New WhatsApp Messaging Features State
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -825,10 +860,23 @@ export function ChatsView({
     setScheduleFormError(null);
     setShowScheduleModal(false);
     setShowContactShareModal(false);
-    if (editingMessageId) {
-      setEditingMessageId(null);
-      setInputText("");
+  }, [activeConversationId]);
+
+  useLayoutEffect(() => {
+    const previousConversationId = draftConversationIdRef.current;
+    if (previousConversationId === activeConversationId) return;
+
+    if (!isEditingMessageRef.current) {
+      saveDraftForConversation(previousConversationId, inputTextRef.current);
     }
+
+    draftConversationIdRef.current = activeConversationId;
+    isEditingMessageRef.current = false;
+    setEditingMessageId(null);
+    setDismissedComposerLinkUrl(null);
+    const nextDraft = draftsRef.current[activeConversationId] ?? "";
+    inputTextRef.current = nextDraft;
+    setInputTextState(nextDraft);
   }, [activeConversationId]);
 
   useEffect(() => {
@@ -1304,7 +1352,11 @@ export function ChatsView({
     if (editingMessageId) {
       const message = (messages[conversationId] ?? []).find((item) => item.id === editingMessageId);
       if (!message || message.isDeleted || message.senderId !== currentUser.id) {
+        isEditingMessageRef.current = false;
         setEditingMessageId(null);
+        const savedDraft = draftsRef.current[conversationId] ?? "";
+        inputTextRef.current = savedDraft;
+        setInputTextState(savedDraft);
         setCopiedToast("This message can no longer be edited.");
         window.setTimeout(() => setCopiedToast(null), 3000);
         return;
@@ -1342,9 +1394,14 @@ export function ChatsView({
           { messageId: message.id, conversationId, text: messageText, isEdited: true },
           conversationId,
         );
+        isEditingMessageRef.current = false;
         setEditingMessageId(null);
-        setInputText("");
-        setDismissedComposerLinkUrl(null);
+        if (activeConversationId === conversationId) {
+          const savedDraft = draftsRef.current[conversationId] ?? "";
+          inputTextRef.current = savedDraft;
+          setInputTextState(savedDraft);
+          setDismissedComposerLinkUrl(null);
+        }
         setCopiedToast("Message edited.");
         window.setTimeout(() => setCopiedToast(null), 2000);
       } catch (error) {
@@ -1389,8 +1446,10 @@ export function ChatsView({
           scheduledDate.toISOString(),
           extra.replyTo ? { replyTo: extra.replyTo } : undefined,
         );
+        saveDraftForConversation(conversationId, "");
         if (activeConversationId === conversationId) {
-          setInputText("");
+          inputTextRef.current = "";
+          setInputTextState("");
           setDismissedComposerLinkUrl(null);
           setReplyingTo(null);
           setScheduledDateTime("");
@@ -1407,13 +1466,28 @@ export function ChatsView({
       return;
     }
 
-    onSendMessage(conversationId, messageText, extra);
-    setInputText("");
-    setDismissedComposerLinkUrl(null);
-    setReplyingTo(null);
-    setShowEmojiPicker(false);
-    setShowScheduleModal(false);
-    setScheduledDateTime("");
+    try {
+      if (await onSendMessage(conversationId, messageText, extra) === false) {
+        setCopiedToast("Message could not be sent. Your draft is still available.");
+        window.setTimeout(() => setCopiedToast(null), 3000);
+        return;
+      }
+    } catch (error) {
+      setCopiedToast(error instanceof Error ? error.message : "Message could not be sent. Your draft is still available.");
+      window.setTimeout(() => setCopiedToast(null), 3000);
+      return;
+    }
+
+    saveDraftForConversation(conversationId, "");
+    if (activeConversationId === conversationId) {
+      inputTextRef.current = "";
+      setInputTextState("");
+      setDismissedComposerLinkUrl(null);
+      setReplyingTo(null);
+      setShowEmojiPicker(false);
+      setShowScheduleModal(false);
+      setScheduledDateTime("");
+    }
   }
 
   // --- Real File & Image Upload Handlers ---
@@ -1810,6 +1884,7 @@ export function ChatsView({
     if (!activeConv || message.senderId !== currentUser.id || message.isDeleted || message.status === "scheduled") {
       return;
     }
+    isEditingMessageRef.current = true;
     setEditingMessageId(message.id);
     setInputText(message.text);
     setReplyingTo(null);
@@ -1818,8 +1893,11 @@ export function ChatsView({
   }
 
   function handleCancelEditingMessage() {
+    isEditingMessageRef.current = false;
     setEditingMessageId(null);
-    setInputText("");
+    const savedDraft = draftsRef.current[activeConversationId] ?? "";
+    inputTextRef.current = savedDraft;
+    setInputTextState(savedDraft);
     setDismissedComposerLinkUrl(null);
   }
 
@@ -2395,6 +2473,9 @@ export function ChatsView({
               const convMsgs = messages[conv.id] ?? [];
               const lastMsg = convMsgs[convMsgs.length - 1];
               const isLockedRestricted = conv.isLocked && !unlockedChatIds.has(conv.id);
+              const draftPreview = isLockedRestricted || !drafts[conv.id]?.trim()
+                ? ""
+                : drafts[conv.id] ?? "";
               const unreadCount = convMsgs.filter(
                 (m) => m.senderId !== currentUser.id && m.status !== "read"
               ).length;
@@ -2436,7 +2517,7 @@ export function ChatsView({
 
                     <div className="conv-snippet-row">
                       <div className="conv-snippet-content">
-                        {lastMsg && lastMsg.senderId === currentUser.id && !isLockedRestricted && (
+                        {!draftPreview && lastMsg && lastMsg.senderId === currentUser.id && !isLockedRestricted && (
                           <span className={`conv-status-ticks ${lastMsg.status === "read" ? "is-read" : ""}`}>
                             {lastMsg.status === "read" || lastMsg.status === "delivered" ? (
                               <CheckCheck size={14} className={lastMsg.status === "read" ? "text-read-ticks" : "text-muted"} />
@@ -2450,7 +2531,9 @@ export function ChatsView({
                             ? "🔒 Locked conversation (Enter PIN to view)"
                             : peerTyping[conv.id] || conv.isTyping
                               ? "typing..."
-                              : getConversationSnippet(lastMsg, conv.description)}
+                              : draftPreview
+                                ? <><span className="conv-draft-label">Draft</span> {draftPreview}</>
+                                : getConversationSnippet(lastMsg, conv.description)}
                         </p>
                       </div>
 
@@ -3483,6 +3566,25 @@ export function ChatsView({
                         onDismiss={() => setDismissedComposerLinkUrl(preview.url)}
                       />
                     ))}
+                    {(draftSaveError || (inputText.length > 0 && !editingMessageId)) && (
+                      <div className="composer-draft-status">
+                        <span role={draftSaveError ? "alert" : undefined}>
+                          {draftSaveError ?? "Draft saved on this device"}
+                        </span>
+                        {draftSaveError ? (
+                          <button
+                            type="button"
+                            onClick={() => saveDraftForConversation(activeConversationId, inputTextRef.current)}
+                          >
+                            Retry
+                          </button>
+                        ) : (
+                          <button type="button" onClick={() => setInputText("")}>
+                            Discard draft
+                          </button>
+                        )}
+                      </div>
+                    )}
                   <div className="chat-input-bar">
                     {/* 1. Emoji Picker Trigger */}
                     <button

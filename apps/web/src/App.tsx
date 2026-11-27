@@ -1246,8 +1246,8 @@ export function App() {
   }
 
   // Send Message Handler with real-time sync & offline outbox queuing
-  function handleSendMessage(conversationId: string, text: string, extra?: Partial<Message>) {
-    if (!currentUser) return;
+  async function handleSendMessage(conversationId: string, text: string, extra?: Partial<Message>): Promise<boolean> {
+    if (!currentUser) return false;
     const conv = conversations.find((c) => c.id === conversationId);
     const targetUserId = conv?.peerUserId;
     const targetPhone = conv?.peerPhone || (conv?.name?.includes("+") ? conv.name : undefined);
@@ -1297,8 +1297,9 @@ export function App() {
 
     if (!navigator.onLine) {
       queueMessage(newMsg);
+      return true;
     } else {
-      void dispatchMessage(newMsg);
+      return (await dispatchMessage(newMsg)) !== "failed";
     }
   }
 
@@ -1771,6 +1772,7 @@ export function App() {
           )}
           {activeTab === "chats" && (
             <ChatsView
+              key={currentUser.id}
               conversations={conversations}
               messages={messages}
               activeConversationId={activeConversationId}

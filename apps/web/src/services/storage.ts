@@ -25,7 +25,12 @@ const STORAGE_KEYS = {
   PIN: "connectsphere_app_pin_v2",
   IS_LOCKED: "connectsphere_is_locked_v2",
   ACCESSIBILITY: "connectsphere_accessibility_v2",
+  DRAFTS: "connectsphere_drafts_v1",
 };
+
+function getUserDraftsStorageKey(userId: string): string {
+  return `${STORAGE_KEYS.DRAFTS}_${encodeURIComponent(userId)}`;
+}
 
 const CUSTOM_WALLPAPER_DB_NAME = "connectsphere_custom_wallpapers";
 const CUSTOM_WALLPAPER_STORE_NAME = "wallpapers";
@@ -132,6 +137,41 @@ const EMPTY_DOC: CollaborativeDoc = {
 };
 
 export const storage = {
+  getDrafts(userId: string): Record<string, string> {
+    if (!userId.trim()) return {};
+    try {
+      const stored = localStorage.getItem(getUserDraftsStorageKey(userId));
+      if (!stored) return {};
+
+      const parsed: unknown = JSON.parse(stored);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+
+      return Object.fromEntries(
+        Object.entries(parsed).filter(
+          ([conversationId, text]) => conversationId.length > 0 && typeof text === "string" && text.length > 0,
+        ),
+      );
+    } catch {
+      return {};
+    }
+  },
+
+  saveDrafts(userId: string, drafts: Record<string, string>): void {
+    if (!userId.trim()) throw new Error("A user is required to save message drafts.");
+
+    const key = getUserDraftsStorageKey(userId);
+    const savedDrafts = Object.fromEntries(
+      Object.entries(drafts).filter(
+        ([conversationId, text]) => conversationId.length > 0 && typeof text === "string" && text.length > 0,
+      ),
+    );
+    if (Object.keys(savedDrafts).length === 0) {
+      localStorage.removeItem(key);
+      return;
+    }
+    localStorage.setItem(key, JSON.stringify(savedDrafts));
+  },
+
   getUser(): User | null {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.USER);
